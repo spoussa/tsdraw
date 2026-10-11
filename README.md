@@ -129,6 +129,13 @@ Log: `%APPDATA%\TSDraw\tsdraw.log` (tray → *Open log*).
 
 ## Good to know
 
+- **Antivirus false alarms:** TSDraw is new and not code-signed, and it does things
+  malware also does: it controls another app, updates itself, and hides a window from
+  screen capture. So Windows Defender may guess it's a threat (e.g.
+  `Trojan:Win32/Sabsik.FL.A!ml`; `!ml` means a machine-learning guess) and remove it.
+  To get it back: Windows Security → Virus & threat protection → Protection history →
+  the TSDraw entry → *Allow*. Reporting the file at
+  https://www.microsoft.com/en-us/wdsi/filesubmission clears it for everyone.
 - **Security:** while TeamSpeak runs with the debug port, any program on your PC can
   control the TeamSpeak UI through `127.0.0.1:39222`. The port is never reachable from
   the network. Programs on your PC can already read your TeamSpeak data, so this adds

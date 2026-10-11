@@ -733,17 +733,8 @@ namespace TSDraw
 
         static Icon MakeIcon()
         {
-            using (var b = new Bitmap(32, 32))
-            {
-                using (var g = Graphics.FromImage(b))
-                {
-                    g.SmoothingMode = SmoothingMode.AntiAlias;
-                    using (var bg = new SolidBrush(Color.FromArgb(10, 132, 255))) g.FillEllipse(bg, 1, 1, 30, 30);
-                    using (var pen = new Pen(Color.White, 3.5f) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round })
-                        g.DrawCurve(pen, new[] { new PointF(8, 21), new PointF(13, 12), new PointF(18, 19), new PointF(24, 10) });
-                }
-                return Icon.FromHandle(b.GetHicon());
-            }
+            using (var s = Assembly.GetExecutingAssembly().GetManifestResourceStream("TSDraw.icon"))
+                return new Icon(s, SystemInformation.SmallIconSize);   // the app icon, at the tray's size
         }
 
         void Shutdown()
