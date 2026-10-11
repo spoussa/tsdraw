@@ -11,6 +11,7 @@ param(
 )
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
+[Environment]::CurrentDirectory = $PSScriptRoot   # what cmd and git inherit; Set-Location alone doesn't change it
 
 function Run($what, [scriptblock]$cmd) {
     & $cmd
@@ -28,7 +29,7 @@ $tag = "v$new"
 if (git tag --list $tag) { throw "$tag already exists - bump the version" }
 [IO.File]::WriteAllText("$PSScriptRoot\VERSION", "$new`n")
 
-Run "build" { cmd /c build.cmd }
+Run "build" { cmd /c "`"$PSScriptRoot\build.cmd`"" }   # full path: cmd may not start in the current folder
 Run "git add" { git add -A }
 git diff --cached --quiet
 if ($LASTEXITCODE -ne 0) { Run "git commit" { git commit -q -m "Release $tag$(if ($Notes) { ": $Notes" })" } }
