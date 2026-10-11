@@ -15,5 +15,7 @@ set /p VER=<VERSION
 if errorlevel 1 exit /b 1
 copy /y relay\tsdraw-relay.py dist\ >nul
 copy /y README.md dist\ >nul
-powershell -NoProfile -Command "Compress-Archive -Force -Path dist\TSDraw.exe,dist\tsdraw-relay.py,dist\README.md -DestinationPath dist\TSDraw.zip"
+rem Antivirus often scans the fresh exe for a moment, so retry the zip; never leave a stale one behind.
+powershell -NoProfile -Command "for ($i = 0; $i -lt 15; $i++) { try { Compress-Archive -Force -ErrorAction Stop -Path dist\TSDraw.exe,dist\tsdraw-relay.py,dist\README.md -DestinationPath dist\TSDraw.zip; exit 0 } catch { Start-Sleep -Milliseconds 700 } }; exit 1"
+if errorlevel 1 (echo Could not create dist\TSDraw.zip & exit /b 1)
 echo Built TSDraw %VER%: dist\TSDraw.exe and dist\TSDraw.zip

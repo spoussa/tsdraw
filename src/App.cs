@@ -179,7 +179,8 @@ namespace TSDraw
 
     class App : ApplicationContext
     {
-        public static readonly string[] Palette = { "#ff3b30", "#ffcc00", "#34c759", "#0a84ff", "#bf5af2", "#ffffff" };
+        // Same order as COLORS in mod.js; the first 8 are the bright ones.
+        public static readonly string[] Palette = { "#ff3b30", "#ff9500", "#ffcc00", "#34c759", "#32d4ff", "#0a84ff", "#bf5af2", "#ff2d92", "#ffffff", "#1c1c1e" };
         const int HotkeyDraw = 1, HotkeyEscape = 2;
 
         public readonly Config Cfg;
@@ -207,6 +208,8 @@ namespace TSDraw
         int badMessages;
 
         class OutboundInfo { public string Sid, SrcId, Title; public int Type; }
+        class PageLayers { public int Inbound; public bool Drawing; }
+        readonly Dictionary<CdpPage, PageLayers> pageLayers = new Dictionary<CdpPage, PageLayers>();
         class PageSessions
         {
             public List<OutboundInfo> Outbound = new List<OutboundInfo>();
@@ -216,12 +219,18 @@ namespace TSDraw
         public App(Config cfg, bool justUpdated)
         {
             Cfg = cfg;
-            DrawColor = ColorTranslator.FromHtml(Palette[(int)((uint)Cfg.Name.GetHashCode() % 5)]);
+            DrawColor = ColorTranslator.FromHtml(Palette[(int)((uint)Cfg.Name.GetHashCode() % 8)]);   // until a TeamSpeak window reports the chosen pen
             ui.CreateControl();
 
             string modJs;
             using (var s = Assembly.GetExecutingAssembly().GetManifestResourceStream("TSDraw.mod.js"))
-            using (var r = new StreamReader(s)) modJs = r.ReadToEnd().Replace("__TSDRAW_VERSION__", Program.Version);
+            using (var r = new StreamReader(s)) modJs = r.ReadToEnd();
+            // Version plus a content hash, so any change to mod.js replaces the copy already injected in TeamSpeak.
+            using (var sha = System.Security.Cryptography.SHA1.Create())
+            {
+                string hash = RoomKeys.Hex(sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(modJs))).Substring(0, 8);
+                modJs = modJs.Replace("__TSDRAW_VERSION__", Program.Version + "-" + hash);
+            }
 
             tray.Icon = MakeIcon();
             tray.Text = "TSDraw";
@@ -244,6 +253,7 @@ namespace TSDraw
             cdp.PageClosed += p => Post(() =>
             {
                 pageSessions.Remove(p);
+                pageLayers.Remove(p);
                 if (master == p)
                 {
                     master = pageSessions.Keys.FirstOrDefault();
@@ -262,7 +272,7 @@ namespace TSDraw
             Log.W(relay == null ? "transport: peer-to-peer" : "transport: relay ({0})", cfg.Relay);
 
             uint mods, vk;
-            hotkeys.Pressed += id => { if (id == HotkeyDraw) ToggleDrawMode(); else if (id == HotkeyEscape) SetDrawMode(false); };
+            hotkeys.Pressed += id => { if (id == HotkeyDraw) OnDrawHotkey(); else if (id == HotkeyEscape) SetDrawMode(false); };
             if (!HotkeyWindow.Parse(cfg.DrawHotkey, out mods, out vk) || !hotkeys.Register(HotkeyDraw, mods, vk))
                 Log.W("could not register draw hotkey \"{0}\"", cfg.DrawHotkey);
 
@@ -366,7 +376,7 @@ namespace TSDraw
         {
             p.Evaluate(RecvJs(new Dictionary<string, object> {
                 { "t", "hello" }, { "name", Cfg.Name }, { "relay", PageRelayStatus() }, { "holdMs", (int)(Cfg.FadeSeconds * 1000) },
-                { "transport", relay == null ? "p2p" : "relay" }, { "master", p == master } }));
+                { "transport", relay == null ? "p2p" : "relay" }, { "master", p == master }, { "hotkey", Cfg.DrawHotkey } }));
         }
 
         static string RecvJs(Dictionary<string, object> msg)
@@ -430,6 +440,13 @@ namespace TSDraw
                     OverlayController rov;
                     if (overlays.TryGetValue(rx.Sid, out rov)) rov.Apply(rx);
                     foreach (var other in pageSessions.Keys.Where(x => x != page).ToList()) other.Evaluate(RecvJs(rx.ToDict()));
+                    break;
+                case "layers":
+                    pageLayers[page] = new PageLayers { Inbound = (int)Json.D(d, "inbound", 0), Drawing = Json.B(d, "drawing") };
+                    break;
+                case "color":
+                    var c = Json.S1(d, "c");
+                    if (c != null && Regex.IsMatch(c, "^#[0-9a-fA-F]{6}$")) DrawColor = ColorTranslator.FromHtml(c);
                     break;
                 case "p2p":
                     p2pOpen = (int)Json.D(d, "open", 0);
@@ -560,6 +577,18 @@ namespace TSDraw
         }
 
         // ------------------------------------------------------------ draw mode
+
+        // The draw hotkey: toggles drawing on the stream you're watching, or - when you're
+        // only streaming - on your own screen.
+        void OnDrawHotkey()
+        {
+            var ov = overlays.Values.FirstOrDefault();
+            if (ov != null && ov.DrawMode) { SetDrawMode(false); return; }
+            var page = pageLayers.Where(kv => kv.Value.Inbound > 0).OrderByDescending(kv => kv.Value.Drawing).Select(kv => kv.Key).FirstOrDefault();
+            if (page != null) { page.Evaluate(RecvJs(new Dictionary<string, object> { { "t", "toggle" } })); return; }
+            if (ov != null) { SetDrawMode(true); return; }
+            Balloon("Nothing to draw on", "Watch a stream or start a screen share in TeamSpeak first.", null);
+        }
 
         void ToggleDrawMode()
         {

@@ -52,9 +52,18 @@ no install and no admin rights. **No server is needed.**
 
 ## Using it
 
-**As a viewer:** hover over a stream you're watching and click the pen at its top right.
-Draw with the left mouse button; pick a colour from the dots; the bin clears your
-drawings; **Esc** or the pen button stops drawing. The small dot on the pen shows the link:
+**As a viewer:** press **Ctrl+Alt+D**, or hover over the stream you're watching and click
+the pen at its top right. Draw with the left mouse button. Ctrl+Alt+D again, **Esc**, or
+the pen button stops drawing. With several streams open, the hotkey picks the one under
+the mouse, otherwise the biggest. The bin clears your drawings.
+
+Colours: click a dot, or press a number key while drawing:
+
+| Key | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 0 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Colour | red | orange | yellow | green | cyan | blue | purple | pink | white | black |
+
+The small dot on the pen shows the link:
 
 | Dot | Meaning |
 | --- | --- |
@@ -65,8 +74,9 @@ drawings; **Esc** or the pen button stops drawing. The small dot on the pen show
 **As the streamer:** nothing to do. Drawings appear over the monitor or window you're
 sharing. They are hidden from the capture, so your viewers see each drawing once, drawn
 crisply on their side, not a second blurry copy inside the video.
-Press **Ctrl+Alt+D** to draw on your own screen (viewers see it). Press Esc or
-Ctrl+Alt+D again to stop. Right-click while drawing clears your drawings.
+When you're not watching anyone else's stream, **Ctrl+Alt+D** lets you draw on your own
+screen (viewers see it), using the pen colour you last picked. Esc or Ctrl+Alt+D again
+stops. Right-click while drawing clears your drawings.
 
 ## Updates
 

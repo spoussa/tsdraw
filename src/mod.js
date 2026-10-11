@@ -10,7 +10,8 @@
     try { window.__tsdraw.remove(); } catch (e) { delete window.__tsdraw; }
   }
 
-  const COLORS = ["#ff3b30", "#ffcc00", "#34c759", "#0a84ff", "#bf5af2", "#ffffff"];
+  const COLORS = ["#ff3b30", "#ff9500", "#ffcc00", "#34c759", "#32d4ff", "#0a84ff", "#bf5af2", "#ff2d92", "#ffffff", "#1c1c1e"];
+  const COLOR_NAMES = ["red", "orange", "yellow", "green", "cyan", "blue", "purple", "pink", "white", "black"];
   const STROKE_WIDTH = 0.006;      // fraction of the frame height
   const FLUSH_MS = 40;             // how often in-progress strokes are sent
   const SCAN_MS = 700;             // how often we look for stream <video> elements
@@ -24,6 +25,8 @@
     relay: "unknown", name: "", helper: false, paused: false,
     transport: "", master: false,  // set by TSDraw.exe: "p2p" or "relay"; master = the page that does networking
     myId: Math.random().toString(36).slice(2, 12),
+    hotkey: "",                    // TSDraw.exe's draw toggle, for tooltips
+    lastLayersJson: "",
     color: loadColor(),
     sessions: { outbound: [], inbound: [] }, lastSessionsJson: "",
     strokes: new Map(),            // sid -> Map(key -> stroke)
@@ -32,7 +35,7 @@
 
   function loadColor() {
     try { const c = localStorage.getItem("tsdraw.color"); if (COLORS.includes(c)) return c; } catch (e) {}
-    return COLORS[Math.floor(Math.random() * 4)];
+    return COLORS[Math.floor(Math.random() * 8)];   // any of the bright ones
   }
   function saveColor(c) { try { localStorage.setItem("tsdraw.color", c); } catch (e) {} }
 
@@ -504,7 +507,7 @@
 .tsdraw-layer canvas{position:absolute;left:0;top:0;pointer-events:none;touch-action:none}
 .tsdraw-layer.tsdraw-on canvas{pointer-events:auto;cursor:crosshair}
 .tsdraw-layer.tsdraw-on{box-shadow:inset 0 0 0 2px var(--tsdraw-color,#0a84ff)}
-.tsdraw-bar{position:absolute;top:8px;right:8px;display:flex;align-items:center;gap:4px;padding:4px;border-radius:999px;
+.tsdraw-bar{position:absolute;top:8px;right:8px;display:flex;align-items:center;gap:4px;padding:4px;border-radius:16px;max-width:calc(100% - 16px);box-sizing:border-box;
   background:rgba(20,24,33,.82);box-shadow:0 2px 8px rgba(0,0,0,.35);pointer-events:auto;opacity:0;transition:opacity .15s;
   font:12px/1 -apple-system,'Segoe UI',sans-serif;color:#fff;user-select:none;z-index:6}
 .tsdraw-host-hover .tsdraw-bar,.tsdraw-layer.tsdraw-on .tsdraw-bar{opacity:1}
@@ -513,9 +516,9 @@
 .tsdraw-btn:hover{background:rgba(255,255,255,.14)}
 .tsdraw-btn.tsdraw-active{background:var(--tsdraw-color,#0a84ff);color:#111}
 .tsdraw-btn svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
-.tsdraw-swatch{width:18px;height:18px;border-radius:999px;border:2px solid rgba(255,255,255,.25);cursor:pointer;padding:0}
-.tsdraw-swatch.tsdraw-sel{border-color:#fff;transform:scale(1.15)}
-.tsdraw-tools{display:none;align-items:center;gap:5px;padding:0 4px}
+.tsdraw-swatch{width:16px;height:16px;border-radius:999px;border:2px solid rgba(255,255,255,.25);cursor:pointer;padding:0;flex:none}
+.tsdraw-swatch.tsdraw-sel{border-color:#fff;transform:scale(1.2)}
+.tsdraw-tools{display:none;flex-wrap:wrap;justify-content:flex-end;align-items:center;gap:4px;padding:0 2px 0 4px;min-width:0}
 .tsdraw-on .tsdraw-tools{display:flex}
 .tsdraw-dot{position:absolute;right:3px;bottom:3px;width:7px;height:7px;border-radius:999px;background:#888;box-shadow:0 0 0 1.5px rgba(20,24,33,.9)}
 .tsdraw-dot.ok{background:#34c759}.tsdraw-dot.wait{background:#ffcc00}.tsdraw-dot.bad{background:#ff3b30}
@@ -566,7 +569,8 @@
       tools.className = "tsdraw-tools";
       this.swatches = COLORS.map((c) => {
         const b = document.createElement("button");
-        b.className = "tsdraw-swatch"; b.style.background = c; b.title = "Pen colour";
+        const i = COLORS.indexOf(c);
+        b.className = "tsdraw-swatch"; b.style.background = c; b.title = COLOR_NAMES[i] + " (" + ((i + 1) % 10) + ")";
         b.addEventListener("click", (e) => { e.stopPropagation(); setColor(c); });
         tools.appendChild(b);
         return b;
@@ -628,7 +632,8 @@
       this.penBtn.classList.toggle("tsdraw-active", this.drawing);
       const [level, problem] = linkStatus(this);
       this.dot.className = "tsdraw-dot " + level;
-      this.penBtn.title = (this.drawing ? "Stop drawing (Esc)" : "Draw on this stream") + (problem ? " - " + problem : "");
+      const key = state.hotkey ? " (" + state.hotkey + ")" : "";
+      this.penBtn.title = (this.drawing ? "Stop drawing" + (key || " (Esc)") : "Draw on this stream" + key) + (problem ? " - " + problem : "");
       if (this.drawing && problem) {
         this.tip.textContent = problem;
         this.tip.classList.add("tsdraw-show");
@@ -641,9 +646,19 @@
       this.drawing = on;
       this.el.classList.toggle("tsdraw-on", on);
       if (!on && this.cur) this.finishStroke();
-      if (on) { this.keyHandler = (e) => { if (e.key === "Escape") this.setDrawing(false); }; document.addEventListener("keydown", this.keyHandler, true); }
+      if (on) { this.keyHandler = (e) => this.onKey(e); document.addEventListener("keydown", this.keyHandler, true); }
       else if (this.keyHandler) { document.removeEventListener("keydown", this.keyHandler, true); this.keyHandler = null; }
       this.refreshUi();
+      reportLayers();
+    }
+
+    onKey(e) {
+      if (e.key === "Escape") { this.setDrawing(false); return; }
+      const t = e.target;
+      const typing = t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName));
+      if (typing || e.ctrlKey || e.altKey || e.metaKey || !/^[0-9]$/.test(e.key)) return;
+      setColor(COLORS[(+e.key + 9) % 10]);
+      e.preventDefault(); e.stopPropagation();
     }
 
     // Size the layer to the <video> box and the canvas to the video frame inside it (object-fit aware).
@@ -816,6 +831,26 @@
   function setColor(c) {
     state.color = c; saveColor(c);
     for (const l of state.layers) l.refreshUi();
+    send({ t: "color", c });   // TSDraw.exe uses it when you draw on your own screen
+  }
+
+  // Tell TSDraw.exe whether there's a stream here to draw on, so its hotkey knows what to toggle.
+  function reportLayers() {
+    const inbound = [...state.layers].filter((l) => l.inbound);
+    const json = JSON.stringify([inbound.length, inbound.some((l) => l.drawing)]);
+    if (json === state.lastLayersJson) return;
+    state.lastLayersJson = json;
+    send({ t: "layers", inbound: inbound.length, drawing: inbound.some((l) => l.drawing) });
+  }
+
+  // The hotkey: stop drawing if we are, else start on the stream under the mouse, else the biggest one.
+  function toggleDrawing() {
+    const inbound = [...state.layers].filter((l) => l.inbound);
+    const active = inbound.find((l) => l.drawing);
+    if (active) { active.setDrawing(false); return; }
+    const hovered = inbound.find((l) => l.host.matches(":hover"));
+    const target = hovered || inbound.sort((a, b) => b.frame.w * b.frame.h - a.frame.w * a.frame.h)[0];
+    if (target) target.setDrawing(true);
   }
 
   function scan() {
@@ -839,6 +874,7 @@
       if (!seen.has(l) || !l.alive()) { l.destroy(); state.layers.delete(l); }
       else { l.layout(); l.refreshUi(); }
     }
+    reportLayers();
   }
 
   // ---------------------------------------------------------------- render loop
@@ -858,7 +894,11 @@
   const api = {
     version: VERSION,
     state,
-    hello() { send({ t: "hello", ver: VERSION, url: location.href }); state.lastSessionsJson = ""; },
+    hello() {
+      send({ t: "hello", ver: VERSION, url: location.href });
+      send({ t: "color", c: state.color });
+      state.lastSessionsJson = ""; state.lastLayersJson = "";
+    },
     // For troubleshooting from DevTools: the peer-to-peer links and their states.
     links() {
       const now = performance.now();
@@ -875,8 +915,11 @@
           if (msg.transport) state.transport = msg.transport;
           if (msg.master != null) state.master = !!msg.master;
           if (msg.name != null) state.name = msg.name;
+          if (msg.hotkey != null) state.hotkey = msg.hotkey;
           if (msg.holdMs) state.holdMs = msg.holdMs;
           for (const l of state.layers) l.refreshUi();
+        } else if (msg.t === "toggle") {
+          toggleDrawing();
         } else if (msg.t === "stroke" || msg.t === "clear") {
           applyRemote(msg);
         } else if (msg.t === "tx") {

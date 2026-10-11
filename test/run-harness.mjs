@@ -64,6 +64,24 @@ results.firstPoint = strokes.length ? strokes[0].p.slice(0, 2) : null;   // expe
 results.ar = strokes.length ? strokes[0].ar : null;
 results.sessions = await ev(`window.sent.filter(m => m.t === 'sessions').length`);
 
+// Hotkey toggle (TSDraw.exe sends "toggle") and number keys picking colours while drawing.
+await call("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+await ev(`__tsdraw.recv({ t: 'toggle' })`);
+results.toggleOn = await ev("document.querySelector('.tsdraw-layer').classList.contains('tsdraw-on')");
+await call("Input.dispatchKeyEvent", { type: "keyDown", key: "2", code: "Digit2", windowsVirtualKeyCode: 50, text: "2" });
+results.colorAfterKey2 = await ev("__tsdraw.state.color");
+await call("Input.dispatchKeyEvent", { type: "keyDown", key: "0", code: "Digit0", windowsVirtualKeyCode: 48, text: "0" });
+results.colorAfterKey0 = await ev("__tsdraw.state.color");
+await call("Input.dispatchKeyEvent", { type: "keyDown", key: "5", code: "Digit5", windowsVirtualKeyCode: 53, text: "5" });
+await mouse("mouseMoved", c[0] + 300, c[1] + 300);
+await sleep(200);
+await shot("3-toolbar.png");
+await ev(`__tsdraw.recv({ t: 'toggle' })`);
+results.toggleOff = await ev("document.querySelector('.tsdraw-layer').classList.contains('tsdraw-on')");
+results.layersMsgs = await ev("window.sent.filter(m => m.t === 'layers').map(m => m.inbound + ':' + m.drawing)");
+results.colorMsgs = await ev("window.sent.filter(m => m.t === 'color').map(m => m.c)");
+await ev(`__tsdraw.recv({ t: 'toggle' })`);
+
 // Escape leaves draw mode; clear removes own strokes.
 await call("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
 await sleep(100);
