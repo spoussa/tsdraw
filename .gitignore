@@ -1,0 +1,6 @@
+dist/
+src/Version.cs
+test-out/
+*.exe
+*.exe.old
+*.exe.new

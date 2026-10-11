@@ -1,0 +1,28 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>TSDraw p2p harness</title>
+<style>
+  body { margin: 0; background: #11151d; display: grid; grid-template-columns: repeat(3, 420px); gap: 8px; padding: 8px; }
+  iframe { width: 420px; height: 260px; border: 0; }
+</style>
+<script>
+  // Plays the TeamSpeak server: every client's metaData, visible to all after a short delay.
+  window.fakeServer = {
+    clients: { 187: { nickname: "Streamer", metaData: "" }, 208: { nickname: "Viewer 208", metaData: "" }, 209: { nickname: "Viewer 209", metaData: "" } },
+    writes: 0, polls: 0, maxLen: 0,
+    set(id, md) {
+      this.writes++;
+      this.maxLen = Math.max(this.maxLen, (md || "").length);
+      setTimeout(() => { this.clients[id].metaData = md; }, 150);
+    },
+  };
+</script>
+</head>
+<body>
+<iframe id="streamer" src="peer.html?role=streamer&id=187"></iframe>
+<iframe id="v208" src="peer.html?role=viewer&id=208"></iframe>
+<iframe id="v209" src="peer.html?role=viewer&id=209"></iframe>
+</body>
+</html>

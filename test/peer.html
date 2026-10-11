@@ -1,0 +1,68 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>TSDraw peer</title>
+<style>
+  body { margin: 0; background: #1c2537; font: 12px sans-serif; color: #ccc; }
+  .tag { position: absolute; left: 6px; top: 4px; z-index: 9; }
+  .stream__video { position: absolute; left: 0; top: 22px; right: 0; bottom: 0; background: #000; }
+  .video-stream { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; }
+  video { width: 100%; height: 100%; object-fit: contain; }
+</style>
+</head>
+<body>
+<div id="vueroot"></div>
+<div class="tag" id="tag"></div>
+<div class="stream__video"><div class="video-stream" id="host"><video id="v" autoplay muted></video></div></div>
+<canvas id="src" width="1280" height="720" style="display:none"></canvas>
+<script>
+  // One fake TeamSpeak client. ?role=streamer|viewer&id=<clientId>. The parent page plays the server.
+  const q = new URLSearchParams(location.search);
+  const ROLE = q.get("role"), ME = +q.get("id"), STREAMER = 187;
+  const SID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  const server = parent.fakeServer;
+  document.getElementById("tag").textContent = ROLE + " (client " + ME + ")";
+
+  const src = document.getElementById("src"), sctx = src.getContext("2d");
+  (function paint() {
+    sctx.fillStyle = "#33415c"; sctx.fillRect(0, 0, 1280, 720);
+    sctx.fillStyle = "#dfe6f2"; sctx.font = "bold 64px sans-serif"; sctx.fillText("Streamer's screen", 80, 140);
+    requestAnimationFrame(paint);
+  })();
+  document.getElementById("v").srcObject = src.captureStream(30);
+
+  const handler = {
+    id: 3,
+    ownClient: { id: ME, get properties() { return server.clients[ME]; } },
+    FindClient(id) { return server.clients[id] ? { id, properties: server.clients[id] } : null; },
+    SetClientSelfProperties() {},
+  };
+  const rootVm = { $children: [{ connection: handler, $children: [] }] };
+  rootVm.$root = rootVm;
+  document.getElementById("vueroot").__vue__ = rootVm;
+  const session = ROLE === "viewer"
+    ? { isInbound: true, displayName: "Streamer", idData: { scHandlerId: 3, serverSessionId: SID, clientId: STREAMER } }
+    : { isInbound: false, displayName: "", idData: { scHandlerId: 3, serverSessionId: SID } };
+  document.getElementById("host").__vue__ = { session, $parent: null, $root: rootVm };
+
+  window.tsclient_internal = {
+    postMessage(msg, cb) {
+      if (msg.cmd !== "requestAllSessions") return;
+      const viewers = Object.keys(server.clients).map(Number).filter((c) => c !== STREAMER).map((c) => ({ clientId: c, scHandlerId: 3, serverSessionId: SID }));
+      cb({ err: 0, payload: ROLE === "viewer"
+        ? { inbound: [{ idData: session.idData }], outbound: [] }
+        : { inbound: [], outbound: [{ idData: session.idData, viewers, sourceInfo: { type: 2, source: { sourceId: "1", title: "" } }, config: { name: "Screen 1" } }] } });
+    },
+    setClientSelfVariables(sc, vars, flush, cb) { server.set(ME, vars.metaData); cb({ metaData: 0 }); },
+    requestClientProperties(sc, id, cb) { server.polls++; cb(0); },
+  };
+  window.sent = [];
+  window.__tsdrawSend = (s) => window.sent.push(JSON.parse(s));
+</script>
+<script src="../src/mod.js"></script>
+<script>
+  __tsdraw.recv({ t: "hello", transport: "p2p", master: true, name: ROLE === "viewer" ? "Viewer " + ME : "Streamer", holdMs: 120000 });
+</script>
+</body>
+</html>
