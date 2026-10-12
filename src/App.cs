@@ -20,6 +20,7 @@ namespace TSDraw
         [STAThread]
         static int Main(string[] args)
         {
+            System.Net.ServicePointManager.SecurityProtocol |= (System.Net.SecurityProtocolType)3072;   // TLS 1.2 for GitHub and 7TV
             if (args.Length > 0 && args[0] == "--relay") return RelayServer.Run(args);
             int oldPid;
             bool updated = args.Length > 1 && args[0] == "--updated" && int.TryParse(args[1], out oldPid);
@@ -425,6 +426,8 @@ namespace TSDraw
                     break;
                 case "stroke":
                 case "clear":
+                case "react":
+                case "img":
                     var m = DrawMsg.FromDict(d);
                     if (m == null || m.T == "here") return;
                     m.From = InstanceId;
@@ -440,6 +443,13 @@ namespace TSDraw
                     OverlayController rov;
                     if (overlays.TryGetValue(rx.Sid, out rov)) rov.Apply(rx);
                     foreach (var other in pageSessions.Keys.Where(x => x != page).ToList()) other.Evaluate(RecvJs(rx.ToDict()));
+                    break;
+                case "7tv":         // emote search for the reactions panel
+                case "emotebytes":  // an emote's image file, for our overlay
+                    AnswerSevenTv(page, d);
+                    break;
+                case "asset":   // reaction frames decoded by the page, for our overlay
+                    ReactionAssets.Add(d);
                     break;
                 case "layers":
                     pageLayers[page] = new PageLayers { Inbound = (int)Json.D(d, "inbound", 0), Drawing = Json.B(d, "drawing") };
@@ -457,6 +467,24 @@ namespace TSDraw
                     Log.W("page: {0}", Json.S1(d, "msg"));
                     break;
             }
+        }
+
+        void AnswerSevenTv(CdpPage page, Dictionary<string, object> d)
+        {
+            string kind = Json.S1(d, "t");
+            int req = (int)Json.D(d, "req", 0);
+            string q = Json.S1(d, "q"), id = Json.S1(d, "id");
+            new Thread(() =>
+            {
+                var reply = new Dictionary<string, object> { { "t", "reply" }, { "req", req } };
+                try
+                {
+                    if (kind == "7tv") reply["items"] = SevenTv.Search(q);
+                    else reply["b64"] = Convert.ToBase64String(SevenTv.EmoteBytes(id));
+                }
+                catch (Exception e) { reply["error"] = "7TV: " + e.GetBaseException().Message; }
+                page.Evaluate(RecvJs(reply));
+            }) { IsBackground = true }.Start();
         }
 
         // ------------------------------------------------------------ relay

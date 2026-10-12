@@ -11,7 +11,7 @@ set /p VER=<VERSION
   /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Web.Extensions.dll ^
   /win32icon:assets\tsdraw.ico /win32manifest:assets\app.manifest ^
   /resource:src\mod.js,TSDraw.mod.js /resource:assets\tsdraw.ico,TSDraw.icon ^
-  src\AssemblyInfo.cs src\App.cs src\Cdp.cs src\Native.cs src\Overlay.cs src\Relay.cs src\Updater.cs src\Util.cs src\Version.cs
+  src\AssemblyInfo.cs src\App.cs src\Cdp.cs src\Native.cs src\Overlay.cs src\Dxgi.cs src\Reactions.cs src\Relay.cs src\SevenTv.cs src\Updater.cs src\Util.cs src\Version.cs
 if errorlevel 1 exit /b 1
 copy /y relay\tsdraw-relay.py dist\ >nul
 copy /y README.md dist\ >nul

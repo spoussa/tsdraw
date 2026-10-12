@@ -58,7 +58,22 @@
     requestClientProperties(sc, id, cb) { server.polls++; cb(0); },
   };
   window.sent = [];
-  window.__tsdrawSend = (s) => window.sent.push(JSON.parse(s));
+  window.__tsdrawSend = (s) => {
+    const m = JSON.parse(s);
+    window.sent.push(m);
+    if (m.t === "7tv") {
+      fetch("https://7tv.io/v4/gql", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
+        query: "query($q: String!) { emotes { search(query: $q, page: 1, perPage: 60, sort: { sortBy: TOP_ALL_TIME, order: DESCENDING }) { items { id defaultName } } } }",
+        variables: { q: m.q } }) }).then((r) => r.json())
+        .then((j) => __tsdraw.recv({ t: "reply", req: m.req, items: j.data.emotes.search.items.map((e) => ({ k: "7tv", ref: e.id, name: e.defaultName })) }))
+        .catch((e) => __tsdraw.recv({ t: "reply", req: m.req, error: String(e) }));
+    } else if (m.t === "emotebytes") {
+      fetch("https://cdn.7tv.app/emote/" + m.id + "/4x.webp").then((r) => r.arrayBuffer()).then((b) => {
+        let x = ""; for (const c of new Uint8Array(b)) x += String.fromCharCode(c);
+        __tsdraw.recv({ t: "reply", req: m.req, b64: btoa(x) });
+      }).catch((e) => __tsdraw.recv({ t: "reply", req: m.req, error: String(e) }));
+    }
+  };
 </script>
 <script src="../src/mod.js"></script>
 <script>

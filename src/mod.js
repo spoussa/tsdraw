@@ -99,6 +99,8 @@
 
   function applyRemote(msg) {
     if (!msg.sid) return;
+    if (msg.t === "react") { spawnReact(msg); return; }
+    if (msg.t === "img") { onImgChunk(msg); return; }
     if (msg.t === "clear") {
       const m = state.strokes.get(msg.sid);
       if (m) for (const [k, s] of m) if (msg.all || s.from === msg.from) m.delete(k);
@@ -423,13 +425,24 @@
 
   // Everything from a peer is untrusted: rebuild it from validated fields only.
   function clean(m, sid, allowAll) {
-    if (!m || (m.t !== "stroke" && m.t !== "clear")) return null;
+    if (!m || !["stroke", "clear", "react", "img", "imgreq"].includes(m.t)) return null;
     const out = {
       t: m.t, sid, from: String(m.from || "").slice(0, 32),
       name: String(m.name || "").replace(/[\u0000-\u001f\u007f]/g, "").slice(0, 32),
     };
     if (!out.from) return null;
     if (m.t === "clear") { out.all = allowAll && !!m.all; return out; }
+    const num = (v, lo, hi) => Math.min(hi, Math.max(lo, isFinite(+v) ? +v : lo));
+    if (m.t === "react") {
+      if (!STROKE_ID.test(m.id) || (m.k !== "7tv" && m.k !== "img") || !(m.k === "7tv" ? SEVENTV_ID : IMG_HASH).test(m.ref)) return null;
+      return Object.assign(out, { id: m.id, k: m.k, ref: m.ref, x: num(m.x, 0, 1), y: num(m.y, 0, 1), s: num(m.s, 0.03, 0.4), ar: num(m.ar, 0, 10) });
+    }
+    if (m.t === "img") {
+      const n = m.n | 0, i = m.i | 0;
+      if (!IMG_HASH.test(m.h) || !IMG_TYPES.includes(m.ty) || typeof m.d !== "string" || m.d.length > 16400 || n < 1 || n > 230 || i < 0 || i >= n) return null;
+      return Object.assign(out, { h: m.h, ty: m.ty, n, i, d: m.d });
+    }
+    if (m.t === "imgreq") return IMG_HASH.test(m.h) ? Object.assign(out, { h: m.h }) : null;
     if (!STROKE_ID.test(m.id)) return null;
     out.id = m.id;
     out.c = HEX_COLOR.test(m.c) ? m.c : "#ff3b30";
@@ -452,12 +465,15 @@
     try { msg = JSON.parse(data); } catch (e) { return; }
     msg = clean(msg, p.sid, p.role === "viewer");   // only the streamer may clear everyone's drawings
     if (!msg) return;
+    if (msg.t === "imgreq") { if (images.has(msg.h)) shareImage(p.sid, msg.h, p); return; }
     applyRemote(msg);
-    send({ t: "rx", msg });                          // streamer: TSDraw.exe draws it on screen; also feeds pop-out windows
+    if (msg.t !== "img") send({ t: "rx", msg });     // streamer: TSDraw.exe draws it on screen; also feeds pop-out windows
     if (p.role === "streamer") {                     // pass it on to our other viewers
       const text = JSON.stringify(msg);
       for (const q of p2p.peers.values()) {
-        if (q !== p && q.sid === p.sid && q.role === "streamer" && q.state === "open") { try { q.ch.send(text); } catch (e) {} }
+        if (q === p || q.sid !== p.sid || q.role !== "streamer" || q.state !== "open") continue;
+        if (msg.t === "img") (q.sentImgs = q.sentImgs || new Set()).add(msg.h);
+        try { q.ch.send(text); } catch (e) {}
       }
     }
   }
@@ -500,6 +516,471 @@
     if (state.transport === "p2p" && state.master) p2pSend(Object.assign({}, msg, { from: state.myId, name: state.name }));
   }
 
+  // ---------------------------------------------------------------- reactions
+  // Twitch-style reaction images dropped on a stream: 7TV emotes (sent as their id) or
+  // your own images (sent once per link in chunks, then referenced by SHA-256 hash).
+
+  const REACT_MS = 4000;
+  const REACT_EMOTE_SIZE = 0.12;            // height, as a fraction of the stream frame
+  const REACT_IMAGE_SIZE = 0.22;
+  const MAX_IMG_BYTES = 2.5 * 1024 * 1024;
+  const IMG_CHUNK = 12000;
+  const SEVENTV_ID = /^[0-9A-Za-z]{20,32}$/, IMG_HASH = /^[0-9a-f]{64}$/;
+  const IMG_TYPES = ["image/gif", "image/png", "image/jpeg", "image/webp"];
+  const DEFAULT_HINT = "Click: random spot · Drag: place it · Right-click: favourite";
+  const images = new Map();                 // hash -> { type, bytes, url, w, h }
+  const incoming = new Map();               // hash -> image still arriving in chunks
+  const waitingForImage = new Map();        // hash -> reactions shown once their image arrives
+  const helperAssets = new Map();           // "7tv:<id>" / "img:<hash>" -> decode job for TSDraw.exe's overlay
+  const imgRequested = new Map(), relayShared = new Map();
+  const myReacts = [];                      // timestamps of our own reactions, for the rate limit
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const helperCalls = new Map();
+  let helperCallId = 0;
+
+  // A request to TSDraw.exe, answered with {t: "reply", req, ...}. TeamSpeak's UI may only fetch()
+  // from TeamSpeak's own servers, so TSDraw.exe talks to 7TV for us.
+  function helperCall(t, args, timeoutMs) {
+    return new Promise((resolve, reject) => {
+      if (!state.helper) { reject(new Error("TSDraw.exe isn't running")); return; }
+      const req = ++helperCallId;
+      const timer = setTimeout(() => { helperCalls.delete(req); reject(new Error("no answer from TSDraw.exe")); }, timeoutMs || 15000);
+      helperCalls.set(req, { resolve, reject, timer });
+      send(Object.assign({ t, req }, args));
+    });
+  }
+
+  function onHelperReply(msg) {
+    const c = helperCalls.get(msg.req);
+    if (!c) return;
+    helperCalls.delete(msg.req);
+    clearTimeout(c.timer);
+    if (msg.error) c.reject(new Error(msg.error)); else c.resolve(msg);
+  }
+  const round4 = (n) => Math.round(n * 10000) / 10000;
+  const emoteUrl = (id, size) => "https://cdn.7tv.app/emote/" + id + "/" + size + ".webp";
+  const assetKey = (m) => (m.k === "7tv" ? "7tv:" : "img:") + m.ref;
+
+  function sniffType(u8) {
+    if (!u8 || u8.length < 12) return null;
+    if (u8[0] === 0x47 && u8[1] === 0x49 && u8[2] === 0x46) return "image/gif";
+    if (u8[0] === 0x89 && u8[1] === 0x50 && u8[2] === 0x4e && u8[3] === 0x47) return "image/png";
+    if (u8[0] === 0xff && u8[1] === 0xd8 && u8[2] === 0xff) return "image/jpeg";
+    if (u8[0] === 0x52 && u8[1] === 0x49 && u8[2] === 0x46 && u8[3] === 0x46 &&
+        u8[8] === 0x57 && u8[9] === 0x45 && u8[10] === 0x42 && u8[11] === 0x50) return "image/webp";
+    return null;
+  }
+
+  function imageUrl(hash) {
+    const e = images.get(hash);
+    if (!e) return null;
+    if (!e.url) e.url = URL.createObjectURL(new Blob([e.bytes], { type: e.type }));
+    return e.url;
+  }
+
+  const isStreaming = (sid) => state.sessions.outbound.some((o) => o.sid === sid);
+
+  // Show a reaction on every layer of its stream; as the streamer, also prepare it for TSDraw.exe's overlay.
+  function spawnReact(m) {
+    if (isStreaming(m.sid)) ensureHelperAsset(m);
+    const src = m.k === "7tv" ? emoteUrl(m.ref, "3x") : imageUrl(m.ref);
+    if (!src) {   // their image is still on its way
+      let list = waitingForImage.get(m.ref);
+      if (!list) waitingForImage.set(m.ref, (list = []));
+      if (list.length < 20) list.push(m);
+      requestImage(m.sid, m.ref);
+      setTimeout(() => { const l = waitingForImage.get(m.ref); if (l && l.includes(m)) l.splice(l.indexOf(m), 1); }, 15000);
+      return;
+    }
+    for (const l of state.layers) if (l.sid === m.sid) l.addReact(m, src);
+  }
+
+  // Our own reaction: x/y in 0..1 of the stream frame, or null for a random spot.
+  function placeReact(layer, item, x, y) {
+    const now = performance.now();
+    while (myReacts.length && now - myReacts[0] > 3000) myReacts.shift();
+    if (myReacts.length >= 6) { if (layer.panel) layer.panel.setHint("Easy - that's a lot of reactions at once.", true); return; }
+    myReacts.push(now);
+    if (x == null) { x = 0.12 + Math.random() * 0.76; y = 0.18 + Math.random() * 0.64; }
+    const v = layer.video, ar = v.videoWidth && v.videoHeight ? round4(v.videoWidth / v.videoHeight) : 0;
+    const msg = { t: "react", sid: layer.sid, id: Math.random().toString(36).slice(2, 10), k: item.k, ref: item.ref,
+      x: round4(x), y: round4(y), s: item.k === "7tv" ? REACT_EMOTE_SIZE : imageSize(item.ref), ar };
+    if (item.k === "img") shareImage(layer.sid, item.ref);
+    spawnReact(Object.assign({ from: "self", name: "" }, msg));
+    emitLocal(msg);
+  }
+
+  function imageSize(hash) {
+    const e = images.get(hash), ar = e && e.w && e.h ? e.w / e.h : 1;
+    return round4(ar > 1.4 ? REACT_IMAGE_SIZE * 1.4 / ar : REACT_IMAGE_SIZE);
+  }
+
+  function imageChunks(sid, hash) {
+    const e = images.get(hash), n = Math.ceil(e.bytes.length / IMG_CHUNK), out = [];
+    for (let i = 0; i < n; i++) {
+      out.push({ t: "img", sid, from: state.myId, h: hash, ty: e.type, n, i, d: b64(e.bytes.subarray(i * IMG_CHUNK, (i + 1) * IMG_CHUNK)) });
+    }
+    return out;
+  }
+
+  // Make sure everyone on the stream has an image before (or soon after) its reaction arrives.
+  function shareImage(sid, hash, onlyPeer) {
+    if (!images.has(hash)) return;
+    if (state.transport === "p2p" && state.master) {
+      let chunks = null;
+      for (const p of p2p.peers.values()) {
+        if (p.sid !== sid || p.state !== "open" || (onlyPeer && p !== onlyPeer)) continue;
+        p.sentImgs = p.sentImgs || new Set();
+        if (p.sentImgs.has(hash) && !onlyPeer) continue;
+        p.sentImgs.add(hash);
+        chunks = chunks || imageChunks(sid, hash).map((c) => JSON.stringify(c));
+        for (const c of chunks) { try { p.ch.send(c); } catch (e) {} }
+      }
+      return;
+    }
+    // Relay mode or a pop-out window: through TSDraw.exe, at most once a minute per image and stream.
+    const k = sid + "|" + hash, now = performance.now();
+    if ((relayShared.get(k) || 0) > now) return;
+    relayShared.set(k, now + 60000);
+    for (const c of imageChunks(sid, hash)) send(c);
+  }
+
+  function requestImage(sid, hash) {
+    const now = performance.now();
+    if ((imgRequested.get(hash) || 0) > now) return;
+    imgRequested.set(hash, now + 10000);
+    if (state.transport === "p2p" && state.master) p2pSend({ t: "imgreq", sid, from: state.myId, h: hash });
+  }
+
+  async function onImgChunk(m) {
+    if (images.has(m.h)) return;
+    let a = incoming.get(m.h);
+    if (!a) {
+      if (incoming.size >= 6) incoming.delete(incoming.keys().next().value);
+      a = { ty: m.ty, n: m.n, parts: new Array(m.n), got: 0, size: 0 };
+      incoming.set(m.h, a);
+    }
+    if (a.n !== m.n || a.ty !== m.ty || a.parts[m.i]) return;
+    let bytes;
+    try { bytes = unb64(m.d); } catch (e) { incoming.delete(m.h); return; }
+    a.size += bytes.length;
+    if (a.size > MAX_IMG_BYTES) { incoming.delete(m.h); return; }
+    a.parts[m.i] = bytes;
+    if (++a.got < a.n) return;
+    incoming.delete(m.h);
+    const all = new Uint8Array(a.size);
+    let off = 0;
+    for (const p of a.parts) { all.set(p, off); off += p.length; }
+    if (hex(await crypto.subtle.digest("SHA-256", all)) !== m.h || sniffType(all) !== a.ty) return;
+    let dims = { w: 0, h: 0 };
+    try { dims = await probeImage(all, a.ty); } catch (e) {}
+    images.set(m.h, { type: a.ty, bytes: all, w: dims.w, h: dims.h });
+    const waiting = waitingForImage.get(m.h);
+    waitingForImage.delete(m.h);
+    for (const r of waiting || []) spawnReact(r);
+  }
+
+  // ---- decoding (Chromium handles GIF, animated WebP, AVIF; TSDraw.exe gets ready-made frames)
+
+  async function probeImage(bytes, type) {
+    if (typeof ImageDecoder === "function") {
+      const dec = new ImageDecoder({ data: bytes, type });
+      try {
+        await dec.tracks.ready;
+        const frames = dec.tracks.selectedTrack ? dec.tracks.selectedTrack.frameCount : 1;
+        const { image } = await dec.decode({ frameIndex: 0 });
+        const r = { w: image.displayWidth, h: image.displayHeight, frames };
+        image.close();
+        return r;
+      } finally { dec.close(); }
+    }
+    const b = await createImageBitmap(new Blob([bytes], { type }));
+    const r = { w: b.width, h: b.height, frames: 1 };
+    b.close();
+    return r;
+  }
+
+  async function decodeFrames(bytes, type, maxFrames) {
+    if (typeof ImageDecoder !== "function") return [{ img: await createImageBitmap(new Blob([bytes], { type })), ms: 0 }];
+    const dec = new ImageDecoder({ data: bytes, type });
+    const frames = [];
+    try {
+      await dec.tracks.ready;
+      const total = dec.tracks.selectedTrack ? dec.tracks.selectedTrack.frameCount : 1;
+      const step = Math.max(1, Math.ceil(total / maxFrames));
+      for (let i = 0; i < total; i += step) {
+        let ms = 0, keep = null;
+        for (let j = i; j < Math.min(total, i + step); j++) {
+          const { image } = await dec.decode({ frameIndex: j });
+          ms += image.duration ? image.duration / 1000 : 100;
+          if (j === i) keep = image; else image.close();
+        }
+        frames.push({ img: keep, ms: total > 1 ? Math.max(20, Math.round(ms)) : 0 });
+      }
+    } finally { dec.close(); }
+    return frames;
+  }
+
+  // All frames side by side in one PNG, at most 192 px tall.
+  async function buildSheet(bytes, type) {
+    const frames = await decodeFrames(bytes, type, 48);
+    const f0 = frames[0].img;
+    const sw = f0.displayWidth || f0.width, sh = f0.displayHeight || f0.height;
+    const h = Math.min(192, sh), w = Math.max(1, Math.min(384, Math.round(sw * h / sh)));
+    const cols = Math.max(1, Math.min(frames.length, Math.floor(4096 / w)));
+    const cv = document.createElement("canvas");
+    cv.width = cols * w; cv.height = Math.ceil(frames.length / cols) * h;
+    const ctx = cv.getContext("2d");
+    frames.forEach((f, i) => { ctx.drawImage(f.img, (i % cols) * w, Math.floor(i / cols) * h, w, h); f.img.close(); });
+    const blob = await new Promise((r) => cv.toBlob(r, "image/png"));
+    const png = await new Promise((r) => { const fr = new FileReader(); fr.onload = () => r(String(fr.result).split(",")[1]); fr.readAsDataURL(blob); });
+    return { w, h, n: frames.length, cols, delays: frames.map((f) => f.ms), png };
+  }
+
+  // As the streamer: TSDraw.exe can't decode WebP/AVIF/animations itself, so decode here, once per emote/image.
+  function ensureHelperAsset(m) {
+    const key = assetKey(m);
+    if (helperAssets.has(key)) return;
+    const job = (async () => {
+      let bytes, type;
+      if (m.k === "7tv") {
+        bytes = unb64((await helperCall("emotebytes", { id: m.ref }, 30000)).b64);
+        type = sniffType(bytes) || "image/webp";
+      } else {
+        for (let i = 0; i < 30 && !images.has(m.ref); i++) await sleep(500);
+        const e = images.get(m.ref);
+        if (!e) throw new Error("the image never arrived");
+        bytes = e.bytes; type = e.type;
+      }
+      send(Object.assign({ t: "asset", key }, await buildSheet(bytes, type)));
+    })();
+    helperAssets.set(key, job);
+    job.catch((e) => { helperAssets.delete(key); log("couldn't prepare reaction " + key + " for the overlay: " + e); });
+  }
+
+  // ---- your own images (kept in IndexedDB) and favourites (localStorage)
+
+  let favs = loadFavs(), myImages = null, popular = null;
+
+  function validItem(it) { return !!it && ((it.k === "7tv" && SEVENTV_ID.test(it.ref)) || (it.k === "img" && IMG_HASH.test(it.ref))); }
+  function loadFavs() {
+    try { const v = JSON.parse(localStorage.getItem("tsdraw.favs") || "[]"); return Array.isArray(v) ? v.filter(validItem).slice(0, 60) : []; }
+    catch (e) { return []; }
+  }
+  const isFav = (it) => favs.some((f) => f.k === it.k && f.ref === it.ref);
+  function toggleFav(it) {
+    favs = isFav(it) ? favs.filter((f) => !(f.k === it.k && f.ref === it.ref)) : [{ k: it.k, ref: it.ref, name: it.name }].concat(favs).slice(0, 60);
+    try { localStorage.setItem("tsdraw.favs", JSON.stringify(favs)); } catch (e) {}
+  }
+
+  function idb(mode, fn) {
+    return new Promise((resolve, reject) => {
+      const open = indexedDB.open("tsdraw", 1);
+      open.onupgradeneeded = () => open.result.createObjectStore("images", { keyPath: "hash" });
+      open.onerror = () => reject(open.error);
+      open.onsuccess = () => {
+        const tx = open.result.transaction("images", mode), req = fn(tx.objectStore("images"));
+        tx.oncomplete = () => { open.result.close(); resolve(req && req.result); };
+        tx.onerror = () => { open.result.close(); reject(tx.error); };
+      };
+    });
+  }
+
+  async function loadMyImages() {
+    if (myImages) return myImages;
+    try {
+      const all = (await idb("readonly", (s) => s.getAll())) || [];
+      all.sort((a, b) => b.added - a.added);
+      for (const e of all) if (!images.has(e.hash)) images.set(e.hash, { type: e.type, bytes: new Uint8Array(e.bytes), w: e.w, h: e.h });
+      myImages = all.map((e) => ({ k: "img", ref: e.hash, name: e.name, w: e.w, h: e.h }));
+    } catch (e) { myImages = []; log("couldn't load saved images: " + e); }
+    return myImages;
+  }
+
+  async function importImage(file) {
+    if (file.size > 16 * 1024 * 1024) throw new Error("that file is too big");
+    let bytes = new Uint8Array(await file.arrayBuffer()), type = sniffType(bytes);
+    if (!type) throw new Error("it isn't a GIF, PNG, JPEG or WebP image");
+    let info = await probeImage(bytes, type);
+    if (info.frames <= 1 && (bytes.length > 300 * 1024 || Math.max(info.w, info.h) > 512)) {   // shrink big stills
+      const b = await createImageBitmap(new Blob([bytes], { type }));
+      const k = Math.min(1, 512 / Math.max(b.width, b.height));
+      const cv = document.createElement("canvas");
+      cv.width = Math.max(1, Math.round(b.width * k)); cv.height = Math.max(1, Math.round(b.height * k));
+      cv.getContext("2d").drawImage(b, 0, 0, cv.width, cv.height);
+      b.close();
+      bytes = new Uint8Array(await (await new Promise((r) => cv.toBlob(r, "image/webp", 0.9))).arrayBuffer());
+      type = "image/webp";
+      info = { w: cv.width, h: cv.height, frames: 1 };
+    }
+    if (bytes.length > MAX_IMG_BYTES) throw new Error("it's " + (bytes.length / 1048576).toFixed(1) + " MB; the limit is 2.5 MB");
+    const hash = hex(await crypto.subtle.digest("SHA-256", bytes));
+    images.set(hash, { type, bytes, w: info.w, h: info.h });
+    const item = { k: "img", ref: hash, name: file.name.slice(0, 40), w: info.w, h: info.h };
+    await loadMyImages();
+    const dropped = myImages.filter((i) => i.ref !== hash).slice(39);
+    myImages = [item].concat(myImages.filter((i) => i.ref !== hash)).slice(0, 40);
+    try {
+      await idb("readwrite", (s) => {
+        s.put({ hash, type, bytes: bytes.slice().buffer, name: item.name, w: info.w, h: info.h, added: Date.now() });
+        for (const d of dropped) s.delete(d.ref);
+      });
+    } catch (e) { log("couldn't save the image: " + e); }
+    return item;
+  }
+
+  async function forgetImage(hash) {
+    myImages = (myImages || []).filter((i) => i.ref !== hash);
+    favs = favs.filter((f) => f.ref !== hash);
+    try { localStorage.setItem("tsdraw.favs", JSON.stringify(favs)); } catch (e) {}
+    try { await idb("readwrite", (s) => s.delete(hash)); } catch (e) {}
+  }
+
+  // ---- 7TV
+
+  async function sevenTv(query) {
+    const r = await helperCall("7tv", { q: query });
+    return (r.items || []).filter(validItem).map((e) => ({ k: "7tv", ref: e.ref, name: String(e.name || "").slice(0, 40) }));
+  }
+
+  // ---- the panel
+
+  class EmotePanel {
+    constructor(layer) {
+      this.layer = layer;
+      const el = this.el = document.createElement("div");
+      el.className = "tsdraw-panel";
+      el.innerHTML = '<div class="tsdraw-ph"><input class="tsdraw-search" type="search" placeholder="Search 7TV emotes" spellcheck="false">' +
+        '<button class="tsdraw-add" title="Add your own image or GIF (max 2.5 MB)">+ Image</button>' +
+        '<input type="file" accept="image/gif,image/png,image/jpeg,image/webp" hidden></div>' +
+        '<div class="tsdraw-pbody"></div><div class="tsdraw-hint"></div>';
+      this.search = el.querySelector(".tsdraw-search");
+      this.body = el.querySelector(".tsdraw-pbody");
+      this.hint = el.querySelector(".tsdraw-hint");
+      this.hint.textContent = DEFAULT_HINT;
+      const file = this.file = el.querySelector("input[type=file]");
+      el.querySelector(".tsdraw-add").addEventListener("click", () => file.click());
+      file.addEventListener("change", () => this.onFile());
+      let timer = 0;
+      this.search.addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(() => this.render(), 350); });
+      el.addEventListener("keydown", (e) => { if (e.key === "Escape") layer.togglePanel(false); });
+      for (const ev of ["click", "dblclick", "mousedown", "mouseup", "pointerdown", "contextmenu", "wheel", "keydown", "keyup", "keypress"]) {
+        el.addEventListener(ev, (e) => e.stopPropagation());
+      }
+      layer.el.appendChild(el);
+      this.render();
+      setTimeout(() => this.search.focus(), 0);
+    }
+
+    setHint(text, bad) {
+      this.hint.textContent = text;
+      this.hint.classList.toggle("tsdraw-bad", !!bad);
+      clearTimeout(this.hintTimer);
+      this.hintTimer = setTimeout(() => { this.hint.textContent = DEFAULT_HINT; this.hint.classList.remove("tsdraw-bad"); }, 5000);
+    }
+
+    async onFile() {
+      const f = this.file.files && this.file.files[0];
+      this.file.value = "";
+      if (!f) return;
+      this.setHint("Adding " + f.name + "...");
+      try {
+        await importImage(f);
+        this.search.value = "";
+        await this.render();
+        this.setHint("Added under My images. Click it to react, or drag it onto the stream.");
+      } catch (e) { this.setHint("Couldn't add it: " + (e.message || e), true); }
+    }
+
+    async render() {
+      const q = this.search.value.trim(), token = (this.token = (this.token || 0) + 1);
+      const sections = [];
+      try {
+        const mine = await loadMyImages();
+        if (q) {
+          this.body.innerHTML = '<div class="tsdraw-empty">Searching 7TV...</div>';
+          const found = await sevenTv(q);
+          sections.push(["My images", mine.filter((i) => i.name.toLowerCase().includes(q.toLowerCase()))], ["7TV", found]);
+        } else {
+          sections.push(["Favourites", favs], ["My images", mine]);
+          if (!popular) {
+            this.body.innerHTML = '<div class="tsdraw-empty">Loading 7TV emotes...</div>';
+            popular = await sevenTv("");
+          }
+          sections.push(["Popular on 7TV", popular]);
+        }
+      } catch (e) {
+        if (token === this.token) this.body.innerHTML = '<div class="tsdraw-empty">Couldn\'t reach 7TV (' + String(e.message || e).replace(/[<>&]/g, "") + ')</div>';
+        return;
+      }
+      if (token !== this.token) return;
+      this.body.textContent = "";
+      for (const [title, items] of sections) {
+        if (!items || !items.length) continue;
+        const head = document.createElement("div");
+        head.className = "tsdraw-sec";
+        head.textContent = title;
+        const grid = document.createElement("div");
+        grid.className = "tsdraw-grid";
+        for (const it of items) grid.appendChild(this.tile(it));
+        this.body.appendChild(head);
+        this.body.appendChild(grid);
+      }
+      if (!this.body.childElementCount) this.body.innerHTML = '<div class="tsdraw-empty">Nothing found</div>';
+    }
+
+    tile(it) {
+      const b = document.createElement("button");
+      b.className = "tsdraw-tile" + (isFav(it) ? " tsdraw-fav" : "");
+      b.title = (it.name || "") + (it.k === "img" ? " (Shift+right-click to remove)" : "");
+      const im = document.createElement("img");
+      im.draggable = false; im.alt = it.name || ""; im.loading = "lazy";
+      im.src = it.k === "7tv" ? emoteUrl(it.ref, "2x") : (imageUrl(it.ref) || "");
+      b.appendChild(im);
+      b.addEventListener("contextmenu", async (e) => {
+        e.preventDefault();
+        if (e.shiftKey && it.k === "img") await forgetImage(it.ref); else toggleFav(it);
+        this.render();
+      });
+      b.addEventListener("pointerdown", (e) => this.drag(e, b, it, im.src));
+      return b;
+    }
+
+    // A click drops the reaction somewhere random; dragging it onto the stream drops it there.
+    drag(e, tile, it, src) {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      try { tile.setPointerCapture(e.pointerId); } catch (x) {}
+      const x0 = e.clientX, y0 = e.clientY;
+      let ghost = null;
+      const move = (ev) => {
+        if (!ghost && Math.hypot(ev.clientX - x0, ev.clientY - y0) < 6) return;
+        if (!ghost) {
+          ghost = document.createElement("img");
+          ghost.className = "tsdraw-ghost"; ghost.src = src;
+          document.body.appendChild(ghost);
+        }
+        ghost.style.left = ev.clientX + "px";
+        ghost.style.top = ev.clientY + "px";
+      };
+      const up = (ev) => {
+        tile.removeEventListener("pointermove", move);
+        tile.removeEventListener("pointerup", up);
+        tile.removeEventListener("pointercancel", up);
+        if (!ghost) { if (ev.type === "pointerup") placeReact(this.layer, it); return; }
+        ghost.remove();
+        const r = this.layer.reactBox.getBoundingClientRect();
+        const x = (ev.clientX - r.left) / r.width, y = (ev.clientY - r.top) / r.height;
+        if (ev.type === "pointerup" && x >= 0 && x <= 1 && y >= 0 && y <= 1) placeReact(this.layer, it, x, y);
+      };
+      tile.addEventListener("pointermove", move);
+      tile.addEventListener("pointerup", up);
+      tile.addEventListener("pointercancel", up);
+    }
+
+    destroy() { this.el.remove(); }
+  }
+
   // ---------------------------------------------------------------- styles
 
   const CSS = `
@@ -524,9 +1005,40 @@
 .tsdraw-dot.ok{background:#34c759}.tsdraw-dot.wait{background:#ffcc00}.tsdraw-dot.bad{background:#ff3b30}
 .tsdraw-tip{position:absolute;top:44px;right:8px;max-width:260px;padding:6px 8px;border-radius:6px;background:rgba(20,24,33,.92);
   color:#fff;font:12px/1.35 -apple-system,'Segoe UI',sans-serif;pointer-events:none;display:none;z-index:6}
-.tsdraw-on .tsdraw-tip.tsdraw-show{display:block}`;
+.tsdraw-on .tsdraw-tip.tsdraw-show{display:block}
+.tsdraw-layer.tsdraw-panel-open .tsdraw-bar{opacity:1}
+.tsdraw-btn.tsdraw-open{background:rgba(255,255,255,.2)}
+.tsdraw-reacts{position:absolute;left:0;top:0;pointer-events:none;overflow:hidden}
+.tsdraw-react{position:absolute;transform:translate(-50%,-50%);animation:tsdraw-react 4s ease-out forwards}
+.tsdraw-react img{height:100%;width:auto;display:block;filter:drop-shadow(0 2px 4px rgba(0,0,0,.45))}
+.tsdraw-react span{position:absolute;top:100%;left:50%;transform:translateX(-50%);margin-top:2px;padding:1px 6px;border-radius:6px;
+  background:rgba(20,24,33,.8);color:#fff;font:600 11px/1.4 -apple-system,'Segoe UI',sans-serif;white-space:nowrap}
+@keyframes tsdraw-react{0%{opacity:0;transform:translate(-50%,-50%) scale(.3)}7%{opacity:1;transform:translate(-50%,-50%) scale(1.15)}
+  13%{transform:translate(-50%,-50%) scale(1)}82%{opacity:1;transform:translate(-50%,-62%) scale(1)}100%{opacity:0;transform:translate(-50%,-80%) scale(.8)}}
+.tsdraw-panel{position:absolute;top:48px;right:8px;width:296px;max-width:calc(100% - 16px);max-height:calc(100% - 64px);display:flex;flex-direction:column;
+  background:rgba(20,24,33,.95);border-radius:12px;box-shadow:0 6px 24px rgba(0,0,0,.45);pointer-events:auto;z-index:7;overflow:hidden;
+  font:12px/1.3 -apple-system,'Segoe UI',sans-serif;color:#e8ecf3}
+.tsdraw-ph{display:flex;gap:6px;padding:8px}
+.tsdraw-search{flex:1;min-width:0;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.14);border-radius:8px;color:#fff;padding:6px 8px;font:inherit;outline:none}
+.tsdraw-search:focus{border-color:var(--tsdraw-color,#0a84ff)}
+.tsdraw-add{background:rgba(255,255,255,.1);border:0;border-radius:8px;color:#fff;padding:0 10px;font:inherit;cursor:pointer;white-space:nowrap}
+.tsdraw-add:hover{background:rgba(255,255,255,.18)}
+.tsdraw-pbody{overflow-y:auto;padding:0 8px 4px;min-height:60px;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.25) transparent}
+.tsdraw-pbody::-webkit-scrollbar{width:8px}.tsdraw-pbody::-webkit-scrollbar-thumb{background:rgba(255,255,255,.22);border-radius:4px}
+.tsdraw-pbody::-webkit-scrollbar-track{background:transparent}
+.tsdraw-sec{margin:6px 2px 4px;font-weight:600;font-size:11px;color:#9aa4b5;text-transform:uppercase;letter-spacing:.04em}
+.tsdraw-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(40px,1fr));gap:4px}
+.tsdraw-tile{height:40px;border:0;border-radius:6px;background:transparent;cursor:grab;padding:3px;display:flex;align-items:center;justify-content:center;position:relative;touch-action:none}
+.tsdraw-tile:hover{background:rgba(255,255,255,.1)}
+.tsdraw-tile img{max-width:100%;max-height:100%;pointer-events:none}
+.tsdraw-tile.tsdraw-fav::after{content:"\u2605";position:absolute;right:2px;top:0;font-size:10px;color:#ffcc00}
+.tsdraw-empty{padding:16px 4px;color:#9aa4b5;text-align:center}
+.tsdraw-hint{padding:6px 10px 8px;color:#9aa4b5;font-size:11px;border-top:1px solid rgba(255,255,255,.06)}
+.tsdraw-hint.tsdraw-bad{color:#ff8a80}
+.tsdraw-ghost{position:fixed;height:56px;transform:translate(-50%,-50%);pointer-events:none;z-index:2147483647;opacity:.9}`;
 
   const ICON_PEN = '<svg viewBox="0 0 24 24"><path d="M4 20l4.5-1 10-10a2.1 2.1 0 0 0-3-3l-10 10L4 20z"/><path d="M14 7l3 3"/></svg>';
+  const ICON_SMILE = '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M8.5 14.5a4.5 4.5 0 0 0 7 0M9 9.5h.01M15 9.5h.01"/></svg>';
   const ICON_TRASH = '<svg viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg>';
 
   function ensureStyle() {
@@ -562,6 +1074,10 @@
       el.style.setProperty("--tsdraw-color", state.color);
       const cv = this.canvas = document.createElement("canvas");
       el.appendChild(cv);
+      const rb = this.reactBox = document.createElement("div");
+      rb.className = "tsdraw-reacts";
+      el.appendChild(rb);
+      this.panel = null;
 
       const bar = this.bar = document.createElement("div");
       bar.className = "tsdraw-bar";
@@ -585,7 +1101,10 @@
       dot.className = "tsdraw-dot";
       pen.appendChild(dot);
       pen.addEventListener("click", (e) => { e.stopPropagation(); this.setDrawing(!this.drawing); });
-      bar.appendChild(tools); bar.appendChild(pen);
+      const emo = this.emoBtn = document.createElement("button");
+      emo.className = "tsdraw-btn"; emo.innerHTML = ICON_SMILE; emo.title = "Reactions: 7TV emotes and your own images";
+      emo.addEventListener("click", (e) => { e.stopPropagation(); this.togglePanel(); });
+      bar.appendChild(tools); bar.appendChild(emo); bar.appendChild(pen);
       el.appendChild(bar);
 
       const tip = this.tip = document.createElement("div");
@@ -618,7 +1137,33 @@
       return this.video.isConnected && this.el.isConnected && this.video.parentElement === this.host;
     }
 
+    togglePanel(on) {
+      if (on === undefined) on = !this.panel;
+      if (on && !this.panel) {
+        for (const l of state.layers) if (l !== this) l.togglePanel(false);
+        this.panel = new EmotePanel(this);
+      } else if (!on && this.panel) { this.panel.destroy(); this.panel = null; }
+      this.el.classList.toggle("tsdraw-panel-open", !!this.panel);
+      this.emoBtn.classList.toggle("tsdraw-open", !!this.panel);
+    }
+
+    addReact(m, src) {
+      const box = this.reactBox;
+      while (box.childElementCount >= 40) box.firstElementChild.remove();
+      const el = document.createElement("div");
+      el.className = "tsdraw-react";
+      el.style.left = m.x * 100 + "%"; el.style.top = m.y * 100 + "%"; el.style.height = m.s * 100 + "%";
+      el.style.animationDuration = REACT_MS + "ms";
+      const im = document.createElement("img");
+      im.src = src; im.alt = ""; im.draggable = false;
+      el.appendChild(im);
+      if (m.from !== "self" && m.name) { const n = document.createElement("span"); n.textContent = m.name; el.appendChild(n); }
+      box.appendChild(el);
+      setTimeout(() => el.remove(), REACT_MS + 50);
+    }
+
     destroy() {
+      this.togglePanel(false);
       this.setDrawing(false);
       this.host.removeEventListener("mouseenter", this.onEnter);
       this.host.removeEventListener("mouseleave", this.onLeave);
@@ -692,6 +1237,11 @@
       if (cs.top !== px(fy)) cs.top = px(fy);
       if (cs.width !== px(fw)) cs.width = px(fw);
       if (cs.height !== px(fh)) cs.height = px(fh);
+      const rs = this.reactBox.style;
+      if (rs.left !== px(fx)) rs.left = px(fx);
+      if (rs.top !== px(fy)) rs.top = px(fy);
+      if (rs.width !== px(fw)) rs.width = px(fw);
+      if (rs.height !== px(fh)) rs.height = px(fh);
     }
 
     norm(e) {
@@ -918,10 +1468,13 @@
           if (msg.hotkey != null) state.hotkey = msg.hotkey;
           if (msg.holdMs) state.holdMs = msg.holdMs;
           for (const l of state.layers) l.refreshUi();
+        } else if (msg.t === "reply") {
+          onHelperReply(msg);
         } else if (msg.t === "toggle") {
           toggleDrawing();
-        } else if (msg.t === "stroke" || msg.t === "clear") {
-          applyRemote(msg);
+        } else if (["stroke", "clear", "react", "img"].includes(msg.t)) {
+          const m = clean(msg, msg.sid, true);
+          if (m) applyRemote(m);
         } else if (msg.t === "tx") {
           // Drawn elsewhere on this PC (the streamer's own screen, or a pop-out window): show it and send it on.
           const m = clean(msg.msg, msg.msg && msg.msg.sid, true);

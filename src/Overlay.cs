@@ -26,20 +26,45 @@ namespace TSDraw
         public double W, Ar;
         public double[] P;
         public bool End, All;
+        public string K, Ref;            // react: "7tv" + emote id, or "img" + image hash
+        public double X, Y, S;
+        public string H, Ty, Data;       // img: one chunk of an image (relayed, never decoded here)
+        public int N, I;
 
         static readonly Regex ColorRe = new Regex("^#[0-9a-fA-F]{6}$");
         static readonly Regex IdRe = new Regex("^[A-Za-z0-9_-]{1,32}$");
+        static readonly Regex EmoteRe = new Regex("^[0-9A-Za-z]{20,32}$"), HashRe = new Regex("^[0-9a-f]{64}$");
+        static readonly Regex Base64Re = new Regex("^[A-Za-z0-9+/=]*$");
+        static readonly string[] ImgTypes = { "image/gif", "image/png", "image/jpeg", "image/webp" };
 
         public static DrawMsg FromDict(Dictionary<string, object> d)
         {
             var m = new DrawMsg { T = Json.S1(d, "t"), Sid = Json.S1(d, "sid") };
-            if ((m.T != "stroke" && m.T != "clear" && m.T != "here") || string.IsNullOrEmpty(m.Sid) || m.Sid.Length > 200) return null;
+            if (!new[] { "stroke", "clear", "here", "react", "img" }.Contains(m.T) || string.IsNullOrEmpty(m.Sid) || m.Sid.Length > 200) return null;
             m.From = Clip(Json.S1(d, "from"), 32);
             m.Name = Clip(Json.S1(d, "name"), 32);
             m.All = Json.B(d, "all");
             if (m.T == "clear" || m.T == "here") return m;
+            if (m.T == "img")
+            {
+                m.H = Json.S1(d, "h"); m.Ty = Json.S1(d, "ty"); m.Data = Json.S1(d, "d");
+                m.N = (int)Json.D(d, "n", 0); m.I = (int)Json.D(d, "i", -1);
+                if (m.H == null || !HashRe.IsMatch(m.H) || !ImgTypes.Contains(m.Ty) || m.Data == null || m.Data.Length > 16400 ||
+                    !Base64Re.IsMatch(m.Data) || m.N < 1 || m.N > 230 || m.I < 0 || m.I >= m.N) return null;
+                return m;
+            }
             m.Id = Json.S1(d, "id");
             if (m.Id == null || !IdRe.IsMatch(m.Id)) return null;
+            if (m.T == "react")
+            {
+                m.K = Json.S1(d, "k"); m.Ref = Json.S1(d, "ref");
+                if (m.Ref == null || !(m.K == "7tv" ? EmoteRe : m.K == "img" ? HashRe : null).IsMatch(m.Ref)) return null;
+                m.X = Math.Max(0, Math.Min(1, Json.D(d, "x", 0.5)));
+                m.Y = Math.Max(0, Math.Min(1, Json.D(d, "y", 0.5)));
+                m.S = Math.Max(0.03, Math.Min(0.4, Json.D(d, "s", 0.12)));
+                m.Ar = Math.Max(0, Math.Min(10, Json.D(d, "ar", 0)));
+                return m;
+            }
             m.C = Json.S1(d, "c");
             if (m.C == null || !ColorRe.IsMatch(m.C)) m.C = "#ff3b30";
             m.W = Math.Max(0.001, Math.Min(0.05, Json.D(d, "w", 0.005)));
@@ -72,6 +97,8 @@ namespace TSDraw
             var d = new Dictionary<string, object> { { "t", T }, { "sid", Sid }, { "from", From ?? "" }, { "name", Name ?? "" } };
             if (T == "here") return d;
             if (T == "clear") { d["all"] = All; return d; }
+            if (T == "img") { d["h"] = H; d["ty"] = Ty; d["n"] = N; d["i"] = I; d["d"] = Data; return d; }
+            if (T == "react") { d["id"] = Id; d["k"] = K; d["ref"] = Ref; d["x"] = Math.Round(X, 4); d["y"] = Math.Round(Y, 4); d["s"] = Math.Round(S, 4); d["ar"] = Math.Round(Ar, 4); return d; }
             d["id"] = Id; d["c"] = C; d["w"] = Math.Round(W, 5); d["end"] = End; d["ar"] = Math.Round(Ar, 4);
             d["p"] = P.Select(v => Math.Round(v, 4)).ToArray();
             return d;
@@ -427,23 +454,28 @@ namespace TSDraw
                 return r.HasValue ? r.Value : Rectangle.Empty;
             }
 
-            // WebRTC numbers screens by their EnumDisplayDevices index.
-            var screens = Screen.AllScreens;
-            Screen pick = null;
+            // WebRTC's DirectX capturer numbers screens in DXGI output order; its GDI fallback uses
+            // EnumDisplayDevices order. A known stream aspect ratio settles any disagreement.
+            var screens = Screen.AllScreens.Select(s => s.Bounds).ToList();
+            Rectangle? pick = null;
             int idx;
             if (int.TryParse(srcId, out idx))
             {
+                var dx = Dxgi.Screens();
+                if (idx >= 0 && idx < dx.Count) pick = dx[idx].Bounds;
                 string dev;
-                if (Native.DisplayDevicesByIndex().TryGetValue(idx, out dev))
-                    pick = screens.FirstOrDefault(s => string.Equals(s.DeviceName, dev, StringComparison.OrdinalIgnoreCase));
+                if (pick == null && Native.DisplayDevicesByIndex().TryGetValue(idx, out dev))
+                {
+                    var s = Screen.AllScreens.FirstOrDefault(x => string.Equals(x.DeviceName, dev, StringComparison.OrdinalIgnoreCase));
+                    if (s != null) pick = s.Bounds;
+                }
             }
-            if (aspect > 0 && (pick == null || !SameAspect(pick.Bounds, aspect)))
+            if (aspect > 0 && (pick == null || !SameAspect(pick.Value, aspect)))
             {
-                var m = screens.Where(s => SameAspect(s.Bounds, aspect)).ToList();
+                var m = screens.Where(s => SameAspect(s, aspect)).ToList();
                 if (m.Count == 1) pick = m[0];
             }
-            if (pick == null) pick = screens.Length == 1 ? screens[0] : Screen.PrimaryScreen;
-            return pick.Bounds;
+            return pick ?? (screens.Count == 1 ? screens[0] : Screen.PrimaryScreen.Bounds);
         }
 
         static bool SameAspect(Rectangle r, double aspect)
@@ -469,6 +501,7 @@ namespace TSDraw
         bool drawMode;
         Stroke cur;
         readonly List<double> pending = new List<double>();
+        readonly List<Reaction> reacts = new List<Reaction>();
 
         public OverlayController(App app, string sid)
         {
@@ -501,7 +534,14 @@ namespace TSDraw
 
         public void Apply(DrawMsg m)
         {
-            if (m.Ar > 0 && Math.Abs(m.Ar - streamAspect) > 0.001) { streamAspect = m.Ar; lastResolve = -100000; }
+            if ((m.T == "stroke" || m.T == "react") && m.Ar > 0 && Math.Abs(m.Ar - streamAspect) > 0.001) { streamAspect = m.Ar; lastResolve = -100000; }
+            if (m.T == "react")
+            {
+                if (reacts.Count < 40) reacts.Add(new Reaction { Key = ReactionAssets.KeyOf(m), X = (float)m.X, Y = (float)m.Y, S = (float)m.S, Created = Clock.Ms });
+                Wake();
+                return;
+            }
+            if (m.T != "stroke" && m.T != "clear") return;
             strokes.Apply(m, app.InstanceId);
             Wake();
         }
@@ -522,6 +562,10 @@ namespace TSDraw
             }
             if (drawMode) Flush(false);
             bool any = strokes.Prune(now);
+            // Reactions start once their frames have arrived from the page; ones that never do are dropped.
+            reacts.RemoveAll(r => r.Start < 0 ? now - r.Created > 15000 : now - r.Start > ReactionAssets.ReactMs);
+            foreach (var r in reacts) if (r.Start < 0 && ReactionAssets.Get(r.Key) != null) r.Start = now;
+            any |= reacts.Count > 0;
             if (target.Width <= 0 || target.Height <= 0 || (!any && !drawMode))
             {
                 win.Hide();
@@ -531,7 +575,11 @@ namespace TSDraw
             }
             win.SetBounds(target);
             if (drawMode) input.Show(target); else input.Hide();
-            win.Render(g => Renderer.Draw(g, strokes, target.Width, target.Height, now, drawMode, app.DrawColor, app.Cfg.DrawHotkey));
+            win.Render(g =>
+            {
+                Renderer.Draw(g, strokes, target.Width, target.Height, now, drawMode, app.DrawColor, app.Cfg.DrawHotkey);
+                ReactionAssets.Draw(g, reacts, target.Width, target.Height, now);
+            });
         }
 
         public void SetDrawMode(bool on)

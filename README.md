@@ -63,6 +63,19 @@ Colours: click a dot, or press a number key while drawing:
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Colour | red | orange | yellow | green | cyan | blue | purple | pink | white | black |
 
+**Reactions:** click the smiley next to the pen to open the reactions panel. It has
+your favourites, your own images, and popular 7TV emotes, and you can search all of 7TV.
+
+- **Click** an emote to drop it at a random spot on the stream.
+- **Drag** it onto the stream to place it exactly.
+- **Right-click** stars it as a favourite.
+- **+ Image** adds your own GIF, PNG, JPEG or WebP (up to 2.5 MB). It's saved under
+  *My images*, and Shift+right-click removes it.
+
+Reactions pop up, float for about 4 seconds and fade out, with your name under them.
+Everyone watching sees them, and so does the streamer, on their own screen (animated,
+and kept out of the stream like drawings).
+
 The small dot on the pen shows the link:
 
 | Dot | Meaning |
@@ -152,6 +165,10 @@ Log: `%APPDATA%\TSDraw\tsdraw.log` (tray → *Open log*).
   little risk, but stop using TSDraw if that bothers you.
 - **Your IP address:** like TeamSpeak's own peer-to-peer streams, a direct link shows
   your IP address to the person you're linked with. With a relay, it doesn't.
+- **7TV:** emote searches and emote images come from 7TV (`7tv.io`, `cdn.7tv.app`), so
+  7TV sees those requests like it does for any Twitch viewer. TeamSpeak's UI may only
+  fetch data from TeamSpeak's own servers, so TSDraw.exe does those two requests for it.
+  Your own images go straight to the people on the stream, encrypted like drawings.
 - **Exclusive-fullscreen games** draw over every other window, so the streamer won't
   see the overlay there. Use borderless/windowed fullscreen.
 - **Sharing a single window:** the overlay follows that window. It also draws over
