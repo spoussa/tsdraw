@@ -103,6 +103,9 @@ namespace TSDraw
         public double FadeSeconds = 3;
         public bool ExcludeOverlayFromCapture = true;
         public bool AutoUpdate = true;
+        public bool ReactionEmotes = true, ReactionImages = true;   // what you see, and what your stream accepts
+        public int ReactionOpacity = 100;                            // percent
+        public double ReactionCooldown = 0;                          // seconds per viewer on your stream
 
         public static Config Load()
         {
@@ -123,6 +126,10 @@ namespace TSDraw
                 c.FadeSeconds = Json.D(d, "fadeSeconds", c.FadeSeconds);
                 if (d.ContainsKey("excludeOverlayFromCapture")) c.ExcludeOverlayFromCapture = Json.B(d, "excludeOverlayFromCapture");
                 if (d.ContainsKey("autoUpdate")) c.AutoUpdate = Json.B(d, "autoUpdate");
+                if (d.ContainsKey("reactionEmotes")) c.ReactionEmotes = Json.B(d, "reactionEmotes");
+                if (d.ContainsKey("reactionImages")) c.ReactionImages = Json.B(d, "reactionImages");
+                c.ReactionOpacity = Math.Max(10, Math.Min(100, (int)Json.D(d, "reactionOpacity", c.ReactionOpacity)));
+                c.ReactionCooldown = Math.Max(0, Math.Min(60, Json.D(d, "reactionCooldown", c.ReactionCooldown)));
             }
             catch (Exception e) { Log.W("config load failed: {0}", e.Message); }
             return c;
@@ -142,7 +149,11 @@ namespace TSDraw
             sb.AppendFormat("  \"drawHotkey\": {0},\n", Json.Str(DrawHotkey));
             sb.AppendFormat(CultureInfo.InvariantCulture, "  \"fadeSeconds\": {0},\n", FadeSeconds);
             sb.AppendFormat("  \"excludeOverlayFromCapture\": {0},\n", ExcludeOverlayFromCapture ? "true" : "false");
-            sb.AppendFormat("  \"autoUpdate\": {0}\n", AutoUpdate ? "true" : "false");
+            sb.AppendFormat("  \"autoUpdate\": {0},\n", AutoUpdate ? "true" : "false");
+            sb.AppendFormat("  \"reactionEmotes\": {0},\n", ReactionEmotes ? "true" : "false");
+            sb.AppendFormat("  \"reactionImages\": {0},\n", ReactionImages ? "true" : "false");
+            sb.AppendFormat("  \"reactionOpacity\": {0},\n", ReactionOpacity);
+            sb.AppendFormat(CultureInfo.InvariantCulture, "  \"reactionCooldown\": {0}\n", ReactionCooldown);
             sb.Append("}\n");
             try { Directory.CreateDirectory(Paths.Dir); File.WriteAllText(Paths.ConfigFile, sb.ToString()); }
             catch (Exception e) { Log.W("config save failed: {0}", e.Message); }

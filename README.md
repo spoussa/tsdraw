@@ -76,6 +76,14 @@ Reactions pop up, float for about 4 seconds and fade out, with your name under t
 Everyone watching sees them, and so does the streamer, on their own screen (animated,
 and kept out of the stream like drawings).
 
+**Reaction settings:** use the ⚙ in the reactions panel, or tray → *Reactions*:
+
+| Setting | What it does |
+| --- | --- |
+| Show 7TV emotes / Show custom images | What you see. While you're streaming, it's also what your stream accepts: other kinds aren't shown on your screen or passed on to your viewers, and their panels grey them out. |
+| Opacity | How see-through reactions are on your screen (10–100%). |
+| Cooldown per viewer | While you're streaming: the time each viewer must wait between reactions. Their panel shows a countdown, and your TSDraw drops anything faster. |
+
 The small dot on the pen shows the link:
 
 | Dot | Meaning |
@@ -147,6 +155,9 @@ bytes; `--password` plus `relayPassword` keeps strangers off it.
 | `fadeSeconds` | `3` | how long strokes stay before fading |
 | `excludeOverlayFromCapture` | `true` | keep drawings out of your stream (needs Windows 10 2004+) |
 | `autoUpdate` | `true` | install new releases automatically |
+| `reactionEmotes`, `reactionImages` | `true` | show 7TV emotes / custom images (and allow them on your stream) |
+| `reactionOpacity` | `100` | reaction opacity in percent |
+| `reactionCooldown` | `0` | seconds each viewer waits between reactions on your stream |
 
 Log: `%APPDATA%\TSDraw\tsdraw.log` (tray → *Open log*).
 

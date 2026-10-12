@@ -30,6 +30,8 @@ namespace TSDraw
         public double X, Y, S;
         public string H, Ty, Data;       // img: one chunk of an image (relayed, never decoded here)
         public int N, I;
+        public bool? PolEmotes, PolImages;   // here: the streamer's reaction rules
+        public double PolCooldown;
 
         static readonly Regex ColorRe = new Regex("^#[0-9a-fA-F]{6}$");
         static readonly Regex IdRe = new Regex("^[A-Za-z0-9_-]{1,32}$");
@@ -44,6 +46,11 @@ namespace TSDraw
             m.From = Clip(Json.S1(d, "from"), 32);
             m.Name = Clip(Json.S1(d, "name"), 32);
             m.All = Json.B(d, "all");
+            if (m.T == "here" && d.ContainsKey("emotes"))
+            {
+                m.PolEmotes = Json.B(d, "emotes"); m.PolImages = Json.B(d, "images");
+                m.PolCooldown = Math.Max(0, Math.Min(60, Json.D(d, "cooldown", 0)));
+            }
             if (m.T == "clear" || m.T == "here") return m;
             if (m.T == "img")
             {
@@ -95,7 +102,11 @@ namespace TSDraw
         public Dictionary<string, object> ToDict()
         {
             var d = new Dictionary<string, object> { { "t", T }, { "sid", Sid }, { "from", From ?? "" }, { "name", Name ?? "" } };
-            if (T == "here") return d;
+            if (T == "here")
+            {
+                if (PolEmotes.HasValue) { d["emotes"] = PolEmotes.Value; d["images"] = PolImages ?? true; d["cooldown"] = PolCooldown; }
+                return d;
+            }
             if (T == "clear") { d["all"] = All; return d; }
             if (T == "img") { d["h"] = H; d["ty"] = Ty; d["n"] = N; d["i"] = I; d["d"] = Data; return d; }
             if (T == "react") { d["id"] = Id; d["k"] = K; d["ref"] = Ref; d["x"] = Math.Round(X, 4); d["y"] = Math.Round(Y, 4); d["s"] = Math.Round(S, 4); d["ar"] = Math.Round(Ar, 4); return d; }
@@ -282,6 +293,14 @@ namespace TSDraw
             screenDC = Native.GetDC(IntPtr.Zero);
             Native.SetLayeredWindowAttributes(Handle, (uint)(Key.R | (Key.G << 8) | (Key.B << 16)), 0, 1 /* LWA_COLORKEY */);
             if (excludeFromCapture) Native.ExcludeFromCapture(Handle, "overlay");
+        }
+
+        // Whole-window opacity on top of the colour key (used for the reactions window).
+        public void SetOpacity(int percent)
+        {
+            percent = Math.Max(10, Math.Min(100, percent));
+            Native.SetLayeredWindowAttributes(Handle, (uint)(Key.R | (Key.G << 8) | (Key.B << 16)), (byte)(percent * 255 / 100),
+                percent >= 100 ? 1u : 3u /* LWA_COLORKEY | LWA_ALPHA */);
         }
 
         public void SetBounds(Rectangle r)
@@ -493,7 +512,9 @@ namespace TSDraw
         readonly App app;
         readonly StrokeSet strokes = new StrokeSet();
         readonly OverlayWindow win;
+        readonly OverlayWindow reactWin;   // reactions get their own window so they can be see-through
         readonly InputWindow input;
+        readonly Dictionary<string, long> lastReactFrom = new Dictionary<string, long>();
         readonly Timer timer = new Timer { Interval = 16 };
         Rectangle target;
         long lastResolve = -100000, lastFlush;
@@ -508,6 +529,8 @@ namespace TSDraw
             this.app = app;
             Sid = sid;
             strokes.HoldMs = (int)(app.Cfg.FadeSeconds * 1000);
+            reactWin = new OverlayWindow(app.Cfg.ExcludeOverlayFromCapture);
+            reactWin.SetOpacity(app.Cfg.ReactionOpacity);
             win = new OverlayWindow(app.Cfg.ExcludeOverlayFromCapture);
             input = new InputWindow(app.Cfg.ExcludeOverlayFromCapture);
             input.MouseDown += OnDown;
@@ -518,6 +541,7 @@ namespace TSDraw
         }
 
         public bool DrawMode { get { return drawMode; } }
+        public void SetReactionOpacity(int percent) { reactWin.SetOpacity(percent); }
         public Rectangle Target { get { return target; } }
         public string Describe()
         {
@@ -537,6 +561,14 @@ namespace TSDraw
             if ((m.T == "stroke" || m.T == "react") && m.Ar > 0 && Math.Abs(m.Ar - streamAspect) > 0.001) { streamAspect = m.Ar; lastResolve = -100000; }
             if (m.T == "react")
             {
+                if (m.From != app.InstanceId)
+                {
+                    if ((m.K == "7tv" && !app.Cfg.ReactionEmotes) || (m.K == "img" && !app.Cfg.ReactionImages)) return;
+                    long now = Clock.Ms, last;
+                    double cd = app.Cfg.ReactionCooldown * 1000;
+                    if (cd > 0 && lastReactFrom.TryGetValue(m.From ?? "", out last) && now - last < cd - 300) return;
+                    lastReactFrom[m.From ?? ""] = now;
+                }
                 if (reacts.Count < 40) reacts.Add(new Reaction { Key = ReactionAssets.KeyOf(m), X = (float)m.X, Y = (float)m.Y, S = (float)m.S, Created = Clock.Ms });
                 Wake();
                 return;
@@ -565,21 +597,28 @@ namespace TSDraw
             // Reactions start once their frames have arrived from the page; ones that never do are dropped.
             reacts.RemoveAll(r => r.Start < 0 ? now - r.Created > 15000 : now - r.Start > ReactionAssets.ReactMs);
             foreach (var r in reacts) if (r.Start < 0 && ReactionAssets.Get(r.Key) != null) r.Start = now;
-            any |= reacts.Count > 0;
-            if (target.Width <= 0 || target.Height <= 0 || (!any && !drawMode))
+            bool reacting = reacts.Count > 0;
+            if (target.Width <= 0 || target.Height <= 0 || (!any && !reacting && !drawMode))
             {
                 win.Hide();
+                reactWin.Hide();
                 input.Hide();
-                if (!any && !drawMode) timer.Stop();
+                if (!any && !reacting && !drawMode) timer.Stop();
                 return;
             }
-            win.SetBounds(target);
-            if (drawMode) input.Show(target); else input.Hide();
-            win.Render(g =>
+            if (reacting)
             {
-                Renderer.Draw(g, strokes, target.Width, target.Height, now, drawMode, app.DrawColor, app.Cfg.DrawHotkey);
-                ReactionAssets.Draw(g, reacts, target.Width, target.Height, now);
-            });
+                reactWin.SetBounds(target);
+                reactWin.Render(g => ReactionAssets.Draw(g, reacts, target.Width, target.Height, now));
+            }
+            else reactWin.Hide();
+            if (any || drawMode)
+            {
+                win.SetBounds(target);
+                win.Render(g => Renderer.Draw(g, strokes, target.Width, target.Height, now, drawMode, app.DrawColor, app.Cfg.DrawHotkey));
+            }
+            else win.Hide();
+            if (drawMode) input.Show(target); else input.Hide();
         }
 
         public void SetDrawMode(bool on)
@@ -661,6 +700,7 @@ namespace TSDraw
             timer.Stop();
             timer.Dispose();
             win.Dispose();
+            reactWin.Dispose();
             input.Dispose();
         }
     }

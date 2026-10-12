@@ -377,7 +377,8 @@ namespace TSDraw
         {
             p.Evaluate(RecvJs(new Dictionary<string, object> {
                 { "t", "hello" }, { "name", Cfg.Name }, { "relay", PageRelayStatus() }, { "holdMs", (int)(Cfg.FadeSeconds * 1000) },
-                { "transport", relay == null ? "p2p" : "relay" }, { "master", p == master }, { "hotkey", Cfg.DrawHotkey } }));
+                { "transport", relay == null ? "p2p" : "relay" }, { "master", p == master }, { "hotkey", Cfg.DrawHotkey },
+                { "reactions", ReactionSettings() } }));
         }
 
         static string RecvJs(Dictionary<string, object> msg)
@@ -448,6 +449,12 @@ namespace TSDraw
                 case "emotebytes":  // an emote's image file, for our overlay
                     AnswerSevenTv(page, d);
                     break;
+                case "settings":   // changed in a reactions panel
+                    SetReactionSettings(d.ContainsKey("emotes") ? Json.B(d, "emotes") : (bool?)null,
+                        d.ContainsKey("images") ? Json.B(d, "images") : (bool?)null,
+                        d.ContainsKey("opacity") ? (int)Json.D(d, "opacity", 100) : (int?)null,
+                        d.ContainsKey("cooldown") ? Json.D(d, "cooldown", 0) : (double?)null);
+                    break;
                 case "asset":   // reaction frames decoded by the page, for our overlay
                     ReactionAssets.Add(d);
                     break;
@@ -467,6 +474,26 @@ namespace TSDraw
                     Log.W("page: {0}", Json.S1(d, "msg"));
                     break;
             }
+        }
+
+        Dictionary<string, object> ReactionSettings()
+        {
+            return new Dictionary<string, object> {
+                { "emotes", Cfg.ReactionEmotes }, { "images", Cfg.ReactionImages },
+                { "opacity", Cfg.ReactionOpacity }, { "cooldown", Cfg.ReactionCooldown } };
+        }
+
+        // From the tray menu or a reactions panel: save, apply to our overlays, tell every TeamSpeak window.
+        void SetReactionSettings(bool? emotes, bool? images, int? opacity, double? cooldown)
+        {
+            if (emotes.HasValue) Cfg.ReactionEmotes = emotes.Value;
+            if (images.HasValue) Cfg.ReactionImages = images.Value;
+            if (opacity.HasValue) Cfg.ReactionOpacity = Math.Max(10, Math.Min(100, opacity.Value));
+            if (cooldown.HasValue) Cfg.ReactionCooldown = Math.Max(0, Math.Min(60, cooldown.Value));
+            Cfg.Save();
+            foreach (var o in overlays.Values) o.SetReactionOpacity(Cfg.ReactionOpacity);
+            cdp.Broadcast(RecvJs(new Dictionary<string, object> { { "t", "status" }, { "reactions", ReactionSettings() } }));
+            AnnouncePresence();
         }
 
         void AnswerSevenTv(CdpPage page, Dictionary<string, object> d)
@@ -573,7 +600,16 @@ namespace TSDraw
         void AnnouncePresence()
         {
             if (relay == null) return;   // peer-to-peer: an open link is the presence signal
-            foreach (var sid in overlays.Keys) Publish(new DrawMsg { T = "here", Sid = sid, From = InstanceId, Name = Cfg.Name });
+            foreach (var sid in overlays.Keys) Publish(HereMsg(sid));
+        }
+
+        DrawMsg HereMsg(string sid)
+        {
+            return new DrawMsg
+            {
+                T = "here", Sid = sid, From = InstanceId, Name = Cfg.Name,
+                PolEmotes = Cfg.ReactionEmotes, PolImages = Cfg.ReactionImages, PolCooldown = Cfg.ReactionCooldown,
+            };
         }
 
         void Recompute()
@@ -590,7 +626,7 @@ namespace TSDraw
                     ov = new OverlayController(this, o.Sid);
                     overlays[o.Sid] = ov;
                     Log.W("you started streaming ({0})", OverlayController.Short(o.Sid));
-                    Publish(new DrawMsg { T = "here", Sid = o.Sid, From = InstanceId, Name = Cfg.Name });
+                    Publish(HereMsg(o.Sid));
                 }
                 ov.UpdateSource(o.Type, o.SrcId, o.Title);
             }
@@ -730,6 +766,7 @@ namespace TSDraw
             };
             m.Items.Add(draw);
             m.Items.Add(new ToolStripMenuItem("Clear my drawings", null, (s, e) => { foreach (var o in overlays.Values) o.ClearOwn(); }) { Enabled = ov != null });
+            m.Items.Add(ReactionsMenu());
             m.Items.Add(new ToolStripSeparator());
 
             bool running = TeamSpeak.Running().Length > 0;
@@ -743,6 +780,31 @@ namespace TSDraw
             m.Items.Add(new ToolStripMenuItem("Open log", null, (s, e) => OpenFile(Paths.LogFile)));
             m.Items.Add(new ToolStripSeparator());
             m.Items.Add(new ToolStripMenuItem("Exit", null, (s, e) => Shutdown()));
+        }
+
+        ToolStripMenuItem ReactionsMenu()
+        {
+            var menu = new ToolStripMenuItem("Reactions");
+            menu.DropDownItems.Add(new ToolStripMenuItem("Show 7TV emotes", null, (s, e) => SetReactionSettings(!Cfg.ReactionEmotes, null, null, null))
+                { Checked = Cfg.ReactionEmotes });
+            menu.DropDownItems.Add(new ToolStripMenuItem("Show custom images", null, (s, e) => SetReactionSettings(null, !Cfg.ReactionImages, null, null))
+                { Checked = Cfg.ReactionImages });
+            var opacity = new ToolStripMenuItem("Opacity");
+            foreach (var pct in new[] { 100, 75, 50, 25 })
+            {
+                int p = pct;
+                opacity.DropDownItems.Add(new ToolStripMenuItem(p + "%", null, (s, e) => SetReactionSettings(null, null, p, null)) { Checked = Cfg.ReactionOpacity == p });
+            }
+            menu.DropDownItems.Add(opacity);
+            var cooldown = new ToolStripMenuItem("Cooldown per viewer (when streaming)");
+            foreach (var sec in new[] { 0, 1, 2, 3, 5, 10, 15, 30, 60 })
+            {
+                int c = sec;
+                cooldown.DropDownItems.Add(new ToolStripMenuItem(c == 0 ? "Off" : c + " s", null, (s, e) => SetReactionSettings(null, null, null, c))
+                    { Checked = Math.Abs(Cfg.ReactionCooldown - c) < 0.01 });
+            }
+            menu.DropDownItems.Add(cooldown);
+            return menu;
         }
 
         static void OpenFile(string path)

@@ -27,6 +27,9 @@
     myId: Math.random().toString(36).slice(2, 12),
     hotkey: "",                    // TSDraw.exe's draw toggle, for tooltips
     lastLayersJson: "",
+    react: { emotes: true, images: true, opacity: 100, cooldown: 0 },   // reaction settings, from TSDraw.exe
+    policies: new Map(),           // sid -> what that stream's streamer accepts (from their "policy" message)
+    lastReactAt: new Map(),        // sid -> when we last reacted there (for the streamer's cooldown)
     color: loadColor(),
     sessions: { outbound: [], inbound: [] }, lastSessionsJson: "",
     strokes: new Map(),            // sid -> Map(key -> stroke)
@@ -100,7 +103,7 @@
   function applyRemote(msg) {
     if (!msg.sid) return;
     if (msg.t === "react") { spawnReact(msg); return; }
-    if (msg.t === "img") { onImgChunk(msg); return; }
+    if (msg.t === "img") { if (state.react.images) onImgChunk(msg); return; }
     if (msg.t === "clear") {
       const m = state.strokes.get(msg.sid);
       if (m) for (const [k, s] of m) if (msg.all || s.from === msg.from) m.delete(k);
@@ -288,6 +291,7 @@
       if (p.role === "viewer") roomKeys(p.sid).then(({ room }) => { delete m.o[room]; writeMeta(p.sc); });
       else { delete m.a[p.remote]; writeMeta(p.sc); }
       log("peer-to-peer link to client " + p.remote + " open (" + p.role + ")");
+      if (p.role === "streamer") sendPolicy(p);
       refreshUis(p.sid);
     };
     ch.onclose = () => peerDown(p, "link closed");
@@ -425,7 +429,7 @@
 
   // Everything from a peer is untrusted: rebuild it from validated fields only.
   function clean(m, sid, allowAll) {
-    if (!m || !["stroke", "clear", "react", "img", "imgreq"].includes(m.t)) return null;
+    if (!m || !["stroke", "clear", "react", "img", "imgreq", "policy"].includes(m.t)) return null;
     const out = {
       t: m.t, sid, from: String(m.from || "").slice(0, 32),
       name: String(m.name || "").replace(/[\u0000-\u001f\u007f]/g, "").slice(0, 32),
@@ -443,6 +447,7 @@
       return Object.assign(out, { h: m.h, ty: m.ty, n, i, d: m.d });
     }
     if (m.t === "imgreq") return IMG_HASH.test(m.h) ? Object.assign(out, { h: m.h }) : null;
+    if (m.t === "policy") return Object.assign(out, { emotes: !!m.emotes, images: !!m.images, cooldown: num(m.cooldown, 0, 60) });
     if (!STROKE_ID.test(m.id)) return null;
     out.id = m.id;
     out.c = HEX_COLOR.test(m.c) ? m.c : "#ff3b30";
@@ -466,6 +471,19 @@
     msg = clean(msg, p.sid, p.role === "viewer");   // only the streamer may clear everyone's drawings
     if (!msg) return;
     if (msg.t === "imgreq") { if (images.has(msg.h)) shareImage(p.sid, msg.h, p); return; }
+    if (msg.t === "policy") {   // the streamer's rules for their stream
+      if (p.role === "viewer") { state.policies.set(p.sid, { emotes: msg.emotes, images: msg.images, cooldown: msg.cooldown }); refreshPanels(p.sid); }
+      return;
+    }
+    if (p.role === "streamer") {   // it's our stream: our rules decide what is shown and passed on
+      if (msg.t === "img" && !state.react.images) return;
+      if (msg.t === "react") {
+        if ((msg.k === "7tv" && !state.react.emotes) || (msg.k === "img" && !state.react.images)) return;
+        const now = performance.now(), cd = state.react.cooldown * 1000;
+        if (cd > 0 && now - (p.lastReact || -1e9) < cd - 300) return;
+        p.lastReact = now;
+      }
+    }
     applyRemote(msg);
     if (msg.t !== "img") send({ t: "rx", msg });     // streamer: TSDraw.exe draws it on screen; also feeds pop-out windows
     if (p.role === "streamer") {                     // pass it on to our other viewers
@@ -582,6 +600,7 @@
 
   // Show a reaction on every layer of its stream; as the streamer, also prepare it for TSDraw.exe's overlay.
   function spawnReact(m) {
+    if (m.from !== "self" && ((m.k === "7tv" && !state.react.emotes) || (m.k === "img" && !state.react.images))) return;
     if (isStreaming(m.sid)) ensureHelperAsset(m);
     const src = m.k === "7tv" ? emoteUrl(m.ref, "3x") : imageUrl(m.ref);
     if (!src) {   // their image is still on its way
@@ -597,6 +616,9 @@
 
   // Our own reaction: x/y in 0..1 of the stream frame, or null for a random spot.
   function placeReact(layer, item, x, y) {
+    const pol = policyFor(layer.sid), wait = cooldownLeft(layer.sid);
+    if ((item.k === "7tv" && !pol.emotes) || (item.k === "img" && !pol.images)) return;
+    if (wait > 0) { if (layer.panel) layer.panel.setHint("Cooldown: wait " + Math.ceil(wait / 1000) + " s", true); return; }
     const now = performance.now();
     while (myReacts.length && now - myReacts[0] > 3000) myReacts.shift();
     if (myReacts.length >= 6) { if (layer.panel) layer.panel.setHint("Easy - that's a lot of reactions at once.", true); return; }
@@ -606,6 +628,7 @@
     const msg = { t: "react", sid: layer.sid, id: Math.random().toString(36).slice(2, 10), k: item.k, ref: item.ref,
       x: round4(x), y: round4(y), s: item.k === "7tv" ? REACT_EMOTE_SIZE : imageSize(item.ref), ar };
     if (item.k === "img") shareImage(layer.sid, item.ref);
+    state.lastReactAt.set(layer.sid, now);
     spawnReact(Object.assign({ from: "self", name: "" }, msg));
     emitLocal(msg);
   }
@@ -843,30 +866,91 @@
     return (r.items || []).filter(validItem).map((e) => ({ k: "7tv", ref: e.ref, name: String(e.name || "").slice(0, 40) }));
   }
 
+  // ---- reaction settings (stored by TSDraw.exe) and the streamer's rules for their stream
+
+  const COOLDOWNS = [0, 1, 2, 3, 5, 10, 15, 30, 60];
+  const ANY_POLICY = { emotes: true, images: true, cooldown: 0 };
+
+  function sanitizeReactSettings(r) {
+    return {
+      emotes: r.emotes !== false, images: r.images !== false,
+      opacity: Math.min(100, Math.max(10, Math.round(+r.opacity || 100))),
+      cooldown: Math.min(60, Math.max(0, +r.cooldown || 0)),
+    };
+  }
+
+  // From TSDraw.exe (hello/status), or a change made in the panel.
+  function applyReactSettings(r, fromPanel) {
+    const next = sanitizeReactSettings(r), before = JSON.stringify(state.react);
+    state.react = next;
+    for (const l of state.layers) l.reactBox.style.opacity = String(next.opacity / 100);
+    if (JSON.stringify(next) === before) return;
+    announcePolicy();
+    for (const l of state.layers) if (l.panel && !(fromPanel && l.panel.settingsOpen)) l.panel.render();
+  }
+
+  function updateReactSettings(partial) {
+    applyReactSettings(Object.assign({}, state.react, partial), true);
+    send(Object.assign({ t: "settings" }, partial));
+  }
+
+  // What may be sent on a stream: our own settings on our stream, else what its streamer announced.
+  function policyFor(sid) {
+    if (isStreaming(sid)) return { emotes: state.react.emotes, images: state.react.images, cooldown: 0 };
+    return state.policies.get(sid) || ANY_POLICY;
+  }
+
+  function cooldownLeft(sid) {
+    const pol = policyFor(sid), last = state.lastReactAt.get(sid);
+    return pol.cooldown > 0 && last !== undefined ? Math.max(0, last + pol.cooldown * 1000 - performance.now()) : 0;
+  }
+
+  function sendPolicy(p) {
+    try { p.ch.send(JSON.stringify({ t: "policy", sid: p.sid, from: state.myId, emotes: state.react.emotes, images: state.react.images, cooldown: state.react.cooldown })); }
+    catch (e) {}
+  }
+
+  // As a streamer: tell our viewers' panels what our stream accepts.
+  function announcePolicy() {
+    if (state.transport !== "p2p" || !state.master) return;
+    for (const p of p2p.peers.values()) if (p.role === "streamer" && p.state === "open") sendPolicy(p);
+  }
+
+  function refreshPanels(sid) {
+    for (const l of state.layers) if (l.sid === sid && l.panel && !l.panel.settingsOpen) l.panel.render();
+  }
+
   // ---- the panel
 
   class EmotePanel {
     constructor(layer) {
       this.layer = layer;
+      this.settingsOpen = false;
       const el = this.el = document.createElement("div");
       el.className = "tsdraw-panel";
-      el.innerHTML = '<div class="tsdraw-ph"><input class="tsdraw-search" type="search" placeholder="Search 7TV emotes" spellcheck="false">' +
+      el.innerHTML = '<div class="tsdraw-ph"><input class="tsdraw-search" type="search" spellcheck="false">' +
         '<button class="tsdraw-add" title="Add your own image or GIF (max 2.5 MB)">+ Image</button>' +
+        '<button class="tsdraw-gear" title="Reaction settings">' + ICON_GEAR + '</button>' +
         '<input type="file" accept="image/gif,image/png,image/jpeg,image/webp" hidden></div>' +
-        '<div class="tsdraw-pbody"></div><div class="tsdraw-hint"></div>';
+        '<div class="tsdraw-note"></div><div class="tsdraw-pbody"></div><div class="tsdraw-hint"></div>';
       this.search = el.querySelector(".tsdraw-search");
       this.body = el.querySelector(".tsdraw-pbody");
+      this.note = el.querySelector(".tsdraw-note");
       this.hint = el.querySelector(".tsdraw-hint");
       this.hint.textContent = DEFAULT_HINT;
+      this.addBtn = el.querySelector(".tsdraw-add");
+      this.gear = el.querySelector(".tsdraw-gear");
       const file = this.file = el.querySelector("input[type=file]");
-      el.querySelector(".tsdraw-add").addEventListener("click", () => file.click());
+      this.addBtn.addEventListener("click", () => file.click());
       file.addEventListener("change", () => this.onFile());
+      this.gear.addEventListener("click", () => { this.settingsOpen = !this.settingsOpen; this.render(); });
       let timer = 0;
       this.search.addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(() => this.render(), 350); });
       el.addEventListener("keydown", (e) => { if (e.key === "Escape") layer.togglePanel(false); });
-      for (const ev of ["click", "dblclick", "mousedown", "mouseup", "pointerdown", "contextmenu", "wheel", "keydown", "keyup", "keypress"]) {
+      for (const ev of ["click", "dblclick", "mousedown", "mouseup", "pointerdown", "contextmenu", "wheel", "keydown", "keyup", "keypress", "input", "change"]) {
         el.addEventListener(ev, (e) => e.stopPropagation());
       }
+      this.cooldownTimer = setInterval(() => this.showCooldown(), 250);
       layer.el.appendChild(el);
       this.render();
       setTimeout(() => this.search.focus(), 0);
@@ -877,6 +961,13 @@
       this.hint.classList.toggle("tsdraw-bad", !!bad);
       clearTimeout(this.hintTimer);
       this.hintTimer = setTimeout(() => { this.hint.textContent = DEFAULT_HINT; this.hint.classList.remove("tsdraw-bad"); }, 5000);
+    }
+
+    showCooldown() {
+      const left = cooldownLeft(this.layer.sid);
+      this.body.classList.toggle("tsdraw-cooling", left > 0 && !this.settingsOpen);
+      if (left > 0) { this.cooling = true; this.hint.textContent = "Next reaction in " + Math.ceil(left / 1000) + " s"; }
+      else if (this.cooling) { this.cooling = false; this.hint.textContent = DEFAULT_HINT; }
     }
 
     async onFile() {
@@ -893,27 +984,48 @@
     }
 
     async render() {
+      this.gear.classList.toggle("tsdraw-open", this.settingsOpen);
+      if (this.settingsOpen) { this.renderSettings(); return; }
+      const pol = policyFor(this.layer.sid), who = this.layer.streamer || "The streamer";
+      const theirs = !isStreaming(this.layer.sid);
+      this.search.disabled = !pol.emotes && !pol.images;
+      this.search.placeholder = pol.emotes ? "Search 7TV emotes" : "Search my images";
+      this.addBtn.disabled = !pol.images;
+      const notes = [];
+      if (!pol.emotes && !pol.images) notes.push(theirs ? who + " has turned reactions off." : "Reactions are off (see settings).");
+      else if (!pol.emotes) notes.push(theirs ? who + " has turned off 7TV emotes." : "7TV emotes are off (see settings).");
+      else if (!pol.images) notes.push(theirs ? who + " has turned off custom images." : "Custom images are off (see settings).");
+      if (theirs && pol.cooldown > 0) notes.push(who + "'s cooldown: one reaction every " + pol.cooldown + " s.");
+      this.note.textContent = notes.join(" ");
+      this.note.style.display = notes.length ? "" : "none";
+      if (!pol.emotes && !pol.images) { this.body.textContent = ""; return; }
+
       const q = this.search.value.trim(), token = (this.token = (this.token || 0) + 1);
+      const allowed = (it) => (it.k === "7tv" ? pol.emotes : pol.images);
       const sections = [];
       try {
-        const mine = await loadMyImages();
+        const mine = pol.images ? await loadMyImages() : [];
         if (q) {
-          this.body.innerHTML = '<div class="tsdraw-empty">Searching 7TV...</div>';
-          const found = await sevenTv(q);
-          sections.push(["My images", mine.filter((i) => i.name.toLowerCase().includes(q.toLowerCase()))], ["7TV", found]);
-        } else {
-          sections.push(["Favourites", favs], ["My images", mine]);
-          if (!popular) {
-            this.body.innerHTML = '<div class="tsdraw-empty">Loading 7TV emotes...</div>';
-            popular = await sevenTv("");
+          sections.push(["My images", mine.filter((i) => i.name.toLowerCase().includes(q.toLowerCase()))]);
+          if (pol.emotes) {
+            this.body.innerHTML = '<div class="tsdraw-empty">Searching 7TV...</div>';
+            sections.push(["7TV", await sevenTv(q)]);
           }
-          sections.push(["Popular on 7TV", popular]);
+        } else {
+          sections.push(["Favourites", favs.filter(allowed)], ["My images", mine]);
+          if (pol.emotes) {
+            if (!popular) {
+              this.body.innerHTML = '<div class="tsdraw-empty">Loading 7TV emotes...</div>';
+              popular = await sevenTv("");
+            }
+            sections.push(["Popular on 7TV", popular]);
+          }
         }
       } catch (e) {
         if (token === this.token) this.body.innerHTML = '<div class="tsdraw-empty">Couldn\'t reach 7TV (' + String(e.message || e).replace(/[<>&]/g, "") + ')</div>';
         return;
       }
-      if (token !== this.token) return;
+      if (token !== this.token || this.settingsOpen) return;
       this.body.textContent = "";
       for (const [title, items] of sections) {
         if (!items || !items.length) continue;
@@ -926,7 +1038,40 @@
         this.body.appendChild(head);
         this.body.appendChild(grid);
       }
-      if (!this.body.childElementCount) this.body.innerHTML = '<div class="tsdraw-empty">Nothing found</div>';
+      if (!this.body.childElementCount) this.body.innerHTML = '<div class="tsdraw-empty">' + (q ? "Nothing found" : "Add an image with + Image") + '</div>';
+    }
+
+    renderSettings() {
+      const r = state.react;
+      this.note.style.display = "none";
+      this.body.innerHTML =
+        '<div class="tsdraw-settings">' +
+        '<div class="tsdraw-sec">Show on my screen</div>' +
+        '<label class="tsdraw-row"><input type="checkbox" data-k="emotes"> 7TV emotes</label>' +
+        '<label class="tsdraw-row"><input type="checkbox" data-k="images"> Custom images</label>' +
+        '<label class="tsdraw-row">Opacity <input type="range" min="10" max="100" step="5" data-k="opacity"> <b class="tsdraw-val"></b></label>' +
+        '<div class="tsdraw-sec">When I\'m streaming</div>' +
+        '<label class="tsdraw-row">Cooldown per viewer <select data-k="cooldown">' +
+        COOLDOWNS.map((s) => '<option value="' + s + '">' + (s ? s + " s" : "off") + "</option>").join("") + "</select></label>" +
+        '<div class="tsdraw-small">Whatever you turn off above is also blocked on your stream while you\'re streaming. ' +
+        "These settings are also in the TSDraw tray menu.</div>" +
+        '<button class="tsdraw-back">Back to reactions</button></div>';
+      const $ = (k) => this.body.querySelector('[data-k="' + k + '"]');
+      const val = this.body.querySelector(".tsdraw-val");
+      $("emotes").checked = r.emotes;
+      $("images").checked = r.images;
+      $("opacity").value = r.opacity;
+      val.textContent = r.opacity + "%";
+      $("cooldown").value = String(COOLDOWNS.includes(r.cooldown) ? r.cooldown : 0);
+      $("emotes").addEventListener("change", (e) => updateReactSettings({ emotes: e.target.checked }));
+      $("images").addEventListener("change", (e) => updateReactSettings({ images: e.target.checked }));
+      $("opacity").addEventListener("input", (e) => {
+        val.textContent = e.target.value + "%";
+        for (const l of state.layers) l.reactBox.style.opacity = String(e.target.value / 100);
+      });
+      $("opacity").addEventListener("change", (e) => updateReactSettings({ opacity: +e.target.value }));
+      $("cooldown").addEventListener("change", (e) => updateReactSettings({ cooldown: +e.target.value }));
+      this.body.querySelector(".tsdraw-back").addEventListener("click", () => { this.settingsOpen = false; this.render(); });
     }
 
     tile(it) {
@@ -978,7 +1123,7 @@
       tile.addEventListener("pointercancel", up);
     }
 
-    destroy() { this.el.remove(); }
+    destroy() { clearInterval(this.cooldownTimer); this.el.remove(); }
   }
 
   // ---------------------------------------------------------------- styles
@@ -1035,10 +1180,26 @@
 .tsdraw-empty{padding:16px 4px;color:#9aa4b5;text-align:center}
 .tsdraw-hint{padding:6px 10px 8px;color:#9aa4b5;font-size:11px;border-top:1px solid rgba(255,255,255,.06)}
 .tsdraw-hint.tsdraw-bad{color:#ff8a80}
-.tsdraw-ghost{position:fixed;height:56px;transform:translate(-50%,-50%);pointer-events:none;z-index:2147483647;opacity:.9}`;
+.tsdraw-ghost{position:fixed;height:56px;transform:translate(-50%,-50%);pointer-events:none;z-index:2147483647;opacity:.9}
+.tsdraw-gear{width:30px;flex:none;background:rgba(255,255,255,.1);border:0;border-radius:8px;color:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0}
+.tsdraw-gear:hover,.tsdraw-gear.tsdraw-open{background:rgba(255,255,255,.2)}
+.tsdraw-gear svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.tsdraw-add:disabled,.tsdraw-search:disabled{opacity:.4;cursor:default}
+.tsdraw-note{margin:0 8px 4px;padding:5px 8px;border-radius:6px;background:rgba(255,204,0,.12);color:#ffd866;font-size:11px}
+.tsdraw-cooling .tsdraw-grid{opacity:.35;pointer-events:none}
+.tsdraw-settings{display:flex;flex-direction:column;gap:6px;padding:2px 2px 8px}
+.tsdraw-row{display:flex;align-items:center;gap:8px;color:#e8ecf3;cursor:pointer}
+.tsdraw-row input[type=range]{flex:1;accent-color:var(--tsdraw-color,#0a84ff)}
+.tsdraw-row input[type=checkbox]{accent-color:var(--tsdraw-color,#0a84ff)}
+.tsdraw-row select{margin-left:auto;background:#262c38;color:#fff;border:1px solid rgba(255,255,255,.15);border-radius:6px;padding:2px 4px;font:inherit}
+.tsdraw-val{min-width:36px;text-align:right;font-weight:600}
+.tsdraw-small{color:#9aa4b5;font-size:11px;line-height:1.35}
+.tsdraw-back{align-self:flex-start;margin-top:4px;background:rgba(255,255,255,.1);border:0;border-radius:8px;color:#fff;padding:5px 10px;font:inherit;cursor:pointer}
+.tsdraw-back:hover{background:rgba(255,255,255,.18)}`;
 
   const ICON_PEN = '<svg viewBox="0 0 24 24"><path d="M4 20l4.5-1 10-10a2.1 2.1 0 0 0-3-3l-10 10L4 20z"/><path d="M14 7l3 3"/></svg>';
   const ICON_SMILE = '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M8.5 14.5a4.5 4.5 0 0 0 7 0M9 9.5h.01M15 9.5h.01"/></svg>';
+  const ICON_GEAR = '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>';
   const ICON_TRASH = '<svg viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg>';
 
   function ensureStyle() {
@@ -1076,6 +1237,7 @@
       el.appendChild(cv);
       const rb = this.reactBox = document.createElement("div");
       rb.className = "tsdraw-reacts";
+      rb.style.opacity = String(state.react.opacity / 100);
       el.appendChild(rb);
       this.panel = null;
 
@@ -1466,6 +1628,7 @@
           if (msg.master != null) state.master = !!msg.master;
           if (msg.name != null) state.name = msg.name;
           if (msg.hotkey != null) state.hotkey = msg.hotkey;
+          if (msg.reactions) applyReactSettings(msg.reactions);
           if (msg.holdMs) state.holdMs = msg.holdMs;
           for (const l of state.layers) l.refreshUi();
         } else if (msg.t === "reply") {
@@ -1481,6 +1644,9 @@
           if (m) { applyRemote(m); if (state.transport === "p2p" && state.master) p2pSend(m); }
         } else if (msg.t === "here") {
           if (msg.sid) state.present.set(msg.sid, performance.now());
+          if (msg.sid && msg.emotes != null) {
+            state.policies.set(msg.sid, { emotes: !!msg.emotes, images: !!msg.images, cooldown: Math.min(60, Math.max(0, +msg.cooldown || 0)) });
+          }
           for (const l of state.layers) if (l.sid === msg.sid) l.refreshUi();
         } else if (msg.t === "bye") {
           state.helper = false; state.relay = "TSDraw.exe exited";
