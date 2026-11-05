@@ -76,6 +76,7 @@
             srcId: src.sourceId != null ? String(src.sourceId) : "",
             title: src.title || "", displayId: src.displayId != null ? src.displayId : -1,
             minimized: !!src.minimized, name: (s.config && s.config.name) || "",
+            status: s.captureStatus != null ? s.captureStatus : 0,
           });
         }
         for (const s of res.payload.inbound || []) {
@@ -84,6 +85,10 @@
         }
         const json = JSON.stringify([outbound, inbound]);
         state.sessions = { outbound, inbound };
+        for (const o of outbound) {   // guarded streams: hook TeamSpeak's object once it's there
+          const a = autoSrc.get(o.sid);
+          if (a && a.guard) { const so = outboundObject(o.sid); if (so) guardStream(so); }
+        }
         if (json !== state.lastSessionsJson) {
           state.lastSessionsJson = json;
           send({ t: "sessions", outbound, inbound });
@@ -1601,6 +1606,115 @@
     if (any) kick();
   }
 
+  // ---------------------------------------------------------------- follow the game
+  // TSDraw.exe sees which program owns the window you share. When a game starts from the
+  // launcher you're sharing (League of Legends), it asks us to move the stream to the game's
+  // window, and back when the game closes. We do it through TeamSpeak's own stream object,
+  // the way its stream menu changes a live stream's source, so viewers stay connected.
+  // TeamSpeak ends a stream when the shared window closes; for a game window TSDraw.exe
+  // "guards", we keep the stream instead and wait for the switch back.
+  const CAPTURE_FAILED = -1, SOURCE_WINDOW = 3;
+  const LOST_GRACE_MS = 60000;   // how long a stream waits for the launcher after its game closed
+  const autoSrc = new Map();     // sid -> { guard: window id or "", busy, lostTimer }
+
+  function autoEntry(sid) {
+    let a = autoSrc.get(sid);
+    if (!a) { a = { guard: "", busy: false, lostTimer: 0 }; autoSrc.set(sid, a); }
+    return a;
+  }
+
+  // TeamSpeak's object for one of our outgoing streams.
+  function outboundObject(sid) {
+    const info = state.sessions.outbound.find((o) => o.sid === sid);
+    const h = info ? handler(info.sc) : null;
+    const lists = h ? [h] : [...p2p.handlers.values()];
+    for (const c of lists) {
+      let streams = null;
+      try { streams = c.outboundStreams; } catch (e) {}
+      for (const s of streams || []) if (s && sidOf(s.idData) === sid) return s;
+    }
+    return null;
+  }
+
+  function windowList() {
+    return new Promise((resolve) => {
+      try {
+        tsclient_internal.postMessage({ cmd: "getWindowList", payload: {} },
+          (r) => resolve(r && r.err === 0 && Array.isArray(r.payload) ? r.payload : []));
+      } catch (e) { resolve([]); }
+    });
+  }
+
+  // Wrap the stream's capture-status hook: on a failed capture of a guarded game window,
+  // do what TeamSpeak does except leaving the stream.
+  function guardStream(s) {
+    if (s.__tsdrawGuarded || typeof s.onCaptureStatusChanged !== "function") return;
+    const orig = s.onCaptureStatusChanged;
+    s.__tsdrawGuarded = true;
+    s.onCaptureStatusChanged = function (st) {
+      const sid = sidOf(this.idData), a = sid ? autoSrc.get(sid) : null;
+      const cur = this.sourceInfo ? String(this.sourceInfo.id) : "";
+      if (st !== CAPTURE_FAILED || !a || !a.guard || a.guard !== cur) return orig.call(this, st);
+      const own = Object.prototype.hasOwnProperty.call(this, "leave"), leave = this.leave;
+      this.leave = () => Promise.resolve();
+      try { orig.call(this, st); } finally { if (own) this.leave = leave; else delete this.leave; }
+      log("the streamed game window closed; keeping the stream to switch back to the launcher");
+      send({ t: "srclost", sid });
+      clearTimeout(a.lostTimer);
+      a.lostTimer = setTimeout(() => {
+        a.lostTimer = 0;
+        if (this.captureStatus === CAPTURE_FAILED && this.id !== -1) {
+          log("no launcher window to switch back to; ending the stream");
+          a.guard = "";
+          Promise.resolve(this.leave()).catch(() => {});
+        }
+      }, LOST_GRACE_MS);
+    };
+  }
+
+  // The fallback if TeamSpeak's object refuses: the native call its stream preview uses.
+  function nativeSwitch(s, info) {
+    return new Promise((resolve, reject) => {
+      const q = typeof s.getQualityWithCamOverrides === "function" ? s.getQualityWithCamOverrides() : s.quality;
+      tsclient_internal.postMessage({ cmd: "switchSource", payload: {
+        id: s.id, type: info.type, source_id: info.id, quality: q, wanted_capability_video_type: info.pixelFormat,
+        wanted_capability_interlaced: info.interlaced, capture_audio: !!(s.config && s.config.audio),
+        app_audio: (s.config && s.config.appAudio) || undefined,
+      } }, (r) => {
+        if (r && r.err === 0) { try { s.sourceInfo = info; } catch (e) {} resolve(); } else reject("switchSource error " + (r && r.err));
+      });
+    });
+  }
+
+  async function onAutoSource(msg) {
+    const sid = msg.sid;
+    if (!sid) return;
+    const a = autoEntry(sid), s = outboundObject(sid), to = msg.to ? String(msg.to) : "";
+    const reply = (ok, extra) => { if (to) send(Object.assign({ t: "autosrc", sid, to, ok }, extra)); };
+    a.guard = msg.guard ? String(msg.guard) : "";   // without the object yet, the session poll hooks it later
+    if (!s) { reply(false, { err: "TeamSpeak's stream object wasn't found" }); return; }
+    guardStream(s);
+    if (!to) return;
+    if (s.sourceInfo && String(s.sourceInfo.id) === to) { reply(true, { title: s.sourceInfo.name || "" }); return; }
+    if (a.busy) return;
+    a.busy = true;
+    try {
+      const w = (await windowList()).find((x) => String(x.sourceId) === to);
+      if (!w) throw new Error("TeamSpeak can't share that window (yet)");
+      const info = { id: String(w.sourceId), type: SOURCE_WINDOW, interlaced: true, pixelFormat: "I420", name: w.title || "", supportsAudio: !!w.supportsAudio };
+      try {
+        await s.updateSession({ fromInfo: info, fromQuality: s.getQualityWithCamOverrides(), fromConfig: Object.assign({}, s.config) });
+      } catch (e) {
+        log("stream update refused (" + (e && e.message || e) + "); switching the capture directly");
+        await nativeSwitch(s, info);
+      }
+      clearTimeout(a.lostTimer); a.lostTimer = 0;
+      reply(true, { title: info.name });
+    } catch (e) {
+      reply(false, { err: String(e && e.message || e) });
+    } finally { a.busy = false; }
+  }
+
   // ---------------------------------------------------------------- helper link
 
   const api = {
@@ -1635,6 +1749,8 @@
           onHelperReply(msg);
         } else if (msg.t === "toggle") {
           toggleDrawing();
+        } else if (msg.t === "autosrc") {
+          onAutoSource(msg);
         } else if (["stroke", "clear", "react", "img"].includes(msg.t)) {
           const m = clean(msg, msg.sid, true);
           if (m) applyRemote(m);

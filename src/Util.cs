@@ -106,6 +106,8 @@ namespace TSDraw
         public bool ReactionEmotes = true, ReactionImages = true;   // what you see, and what your stream accepts
         public int ReactionOpacity = 100;                            // percent
         public double ReactionCooldown = 0;                          // seconds per viewer on your stream
+        public bool AutoSwitchToGame = true;                         // move a launcher's stream to its game and back
+        public List<string[]> AutoSwitchGames = new List<string[]>();   // extra [launcher(s), game(s)] pairs
 
         public static Config Load()
         {
@@ -130,6 +132,12 @@ namespace TSDraw
                 if (d.ContainsKey("reactionImages")) c.ReactionImages = Json.B(d, "reactionImages");
                 c.ReactionOpacity = Math.Max(10, Math.Min(100, (int)Json.D(d, "reactionOpacity", c.ReactionOpacity)));
                 c.ReactionCooldown = Math.Max(0, Math.Min(60, Json.D(d, "reactionCooldown", c.ReactionCooldown)));
+                if (d.ContainsKey("autoSwitchToGame")) c.AutoSwitchToGame = Json.B(d, "autoSwitchToGame");
+                foreach (var e in Json.Arr(d, "autoSwitchGames"))
+                {
+                    var g = e as Dictionary<string, object>;
+                    if (g != null) c.AutoSwitchGames.Add(new[] { Json.S1(g, "launcher") ?? "", Json.S1(g, "game") ?? "" });
+                }
             }
             catch (Exception e) { Log.W("config load failed: {0}", e.Message); }
             return c;
@@ -153,7 +161,13 @@ namespace TSDraw
             sb.AppendFormat("  \"reactionEmotes\": {0},\n", ReactionEmotes ? "true" : "false");
             sb.AppendFormat("  \"reactionImages\": {0},\n", ReactionImages ? "true" : "false");
             sb.AppendFormat("  \"reactionOpacity\": {0},\n", ReactionOpacity);
-            sb.AppendFormat(CultureInfo.InvariantCulture, "  \"reactionCooldown\": {0}\n", ReactionCooldown);
+            sb.AppendFormat(CultureInfo.InvariantCulture, "  \"reactionCooldown\": {0},\n", ReactionCooldown);
+            sb.AppendFormat("  \"autoSwitchToGame\": {0},\n", AutoSwitchToGame ? "true" : "false");
+            sb.Append("  \"autoSwitchGames\": [");
+            for (int i = 0; i < AutoSwitchGames.Count; i++)
+                sb.AppendFormat("{0}\n    {{ \"launcher\": {1}, \"game\": {2} }}", i > 0 ? "," : "",
+                    Json.Str(AutoSwitchGames[i][0]), Json.Str(AutoSwitchGames[i][1]));
+            sb.Append(AutoSwitchGames.Count > 0 ? "\n  ]\n" : "]\n");
             sb.Append("}\n");
             try { Directory.CreateDirectory(Paths.Dir); File.WriteAllText(Paths.ConfigFile, sb.ToString()); }
             catch (Exception e) { Log.W("config save failed: {0}", e.Message); }

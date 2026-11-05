@@ -64,6 +64,10 @@ namespace TSDraw
         [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hwnd);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr hwnd, StringBuilder sb, int max);
         [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lParam);
+        [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+        [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr hwnd, uint cmd);
+        [DllImport("user32.dll")] static extern int GetWindowTextLength(IntPtr hwnd);
+        [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
         [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr hwnd, int id, uint mods, uint vk);
         [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr hwnd, int id);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
@@ -123,6 +127,27 @@ namespace TSDraw
                 return true;
             }, IntPtr.Zero);
             return found;
+        }
+
+        public static int WindowPid(IntPtr hwnd)
+        {
+            uint pid;
+            return GetWindowThreadProcessId(hwnd, out pid) == 0 ? 0 : (int)pid;
+        }
+
+        // The windows of these processes that show up as apps: visible, titled, not owned by
+        // another window and not tool windows (the same kind TeamSpeak offers to share).
+        public static List<IntPtr> AppWindows(HashSet<int> pids)
+        {
+            var list = new List<IntPtr>();
+            EnumWindows((h, l) =>
+            {
+                if (IsWindowVisible(h) && pids.Contains(WindowPid(h)) && GetWindow(h, 4 /* GW_OWNER */) == IntPtr.Zero &&
+                    (GetWindowLong(h, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) == 0 && GetWindowTextLength(h) > 0)
+                    list.Add(h);
+                return true;
+            }, IntPtr.Zero);
+            return list;
         }
 
         // The rectangle Windows Graphics Capture records for a window: its frame without the drop shadow.

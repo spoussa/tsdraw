@@ -1,0 +1,66 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>TSDraw follow-the-game harness</title>
+</head>
+<body>
+<div id="app"></div>
+<script>
+  // A fake TeamSpeak with one outgoing window stream. FakeOutbound behaves like TeamSpeak's
+  // outbound stream object: the captureStatus setter calls onCaptureStatusChanged, which
+  // leaves the stream when the capture fails; updateSession changes a live stream's source.
+  const SID = "99999999-8888-7777-6666-555555555555";
+  // The 60 s wait for the launcher is shortened so the test can see it run out.
+  const realSetTimeout = window.setTimeout;
+  window.setTimeout = (f, ms, ...a) => realSetTimeout(f, ms === 60000 ? 400 : ms, ...a);
+
+  class FakeOutbound {
+    constructor() {
+      this.id = 7; this.idData = { scHandlerId: 1, serverSessionId: SID };
+      this._sourceInfo = { id: "100", type: 3, name: "League of Legends", interlaced: true, pixelFormat: "I420" };
+      this._captureStatus = 4; this.config = { name: "League of Legends", type: 3, audio: true }; this._published = true;
+      this.left = 0; this.statusCalls = 0; this.updates = []; this.rejectUpdates = false;
+    }
+    get sourceInfo() { return this._sourceInfo; }
+    set sourceInfo(e) { this._sourceInfo = e; }
+    get captureStatus() { return this._captureStatus; }
+    set captureStatus(e) { if (this._captureStatus !== e) { this._captureStatus = e; this.onCaptureStatusChanged(e); } }
+    onCaptureStatusChanged(e) { this.statusCalls++; if (e === -1) this.leave().finally(() => {}); }
+    leave() { this.left++; return Promise.resolve(); }
+    getQualityWithCamOverrides() { return { width: 1280, height: 720, fps: 30, bitrate: 3e6, audioBitrate: 128e3, cameraWidth: 0, cameraHeight: 0 }; }
+    async updateSession(e) {
+      if (this.rejectUpdates) throw "session must be published to be updated";
+      this.updates.push(JSON.parse(JSON.stringify(e)));
+      this._sourceInfo = e.fromInfo;
+      this.config = Object.assign({}, e.fromConfig, { name: e.fromInfo.name });
+    }
+  }
+  const stream = window.stream = new FakeOutbound();
+  const conn = { id: 1, ownClient: { clientId: 5 }, FindClient() { return null; }, get outboundStreams() { return [stream]; } };
+  document.getElementById("app").__vue__ = { $root: { $children: [{ connection: conn, $children: [] }] } };
+
+  window.nativeSwitches = [];
+  window.tsclient_internal = {
+    postMessage(msg, cb) {
+      if (msg.cmd === "requestAllSessions") {
+        cb({ err: 0, payload: { inbound: [], outbound: [{ idData: stream.idData, captureStatus: stream.captureStatus, viewers: [],
+          sourceInfo: { type: 3, source: { sourceId: stream.sourceInfo.id, title: stream.sourceInfo.name } }, config: stream.config }] } });
+      } else if (msg.cmd === "getWindowList") {
+        cb({ err: 0, payload: [
+          { sourceId: "100", title: "League of Legends", supportsAudio: true, minimized: false, active: false, displayId: -1 },
+          { sourceId: "200", title: "League of Legends (TM) Client", supportsAudio: true, minimized: false, active: true, displayId: -1 },
+          { sourceId: "300", title: "League of Legends (TM) Client", supportsAudio: true, minimized: false, active: false, displayId: -1 }] });
+      } else if (msg.cmd === "switchSource") {
+        window.nativeSwitches.push(msg.payload);
+        cb({ err: 0 });
+      } else if (cb) cb({ err: 1 });
+    },
+    setClientSelfVariables(sc, v, x, cb) { if (cb) cb(0); },
+  };
+  window.sent = [];
+  window.__tsdrawSend = (s) => window.sent.push(JSON.parse(s));
+</script>
+<script src="../src/mod.js"></script>
+</body>
+</html>

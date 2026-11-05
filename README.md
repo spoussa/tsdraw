@@ -92,6 +92,14 @@ The small dot on the pen shows the link:
 | amber | connecting, or the streamer isn't running TSDraw (it keeps retrying every minute or so) |
 | red | can't reach the streamer (see *When peer-to-peer can't connect*), or TSDraw.exe isn't running |
 
+**Streaming League of Legends:** share the League client window as usual. When a game
+starts, TSDraw moves your stream to the game window by itself, and back to the client
+when the game ends, like Discord does. Viewers stay connected through both switches. If
+you switch back to the client yourself mid-game, TSDraw leaves it there. If League closes
+its client during games, the stream waits up to a minute for the client to come back
+(viewers see the last frame), then ends. Turn this off in tray → *Switch my stream to the
+game when it starts*; other launchers and games can be added with `autoSwitchGames`.
+
 **As the streamer:** nothing to do. Drawings appear over the monitor or window you're
 sharing. They are hidden from the capture, so your viewers see each drawing once, drawn
 crisply on their side, not a second blurry copy inside the video.
@@ -158,6 +166,8 @@ bytes; `--password` plus `relayPassword` keeps strangers off it.
 | `reactionEmotes`, `reactionImages` | `true` | show 7TV emotes / custom images (and allow them on your stream) |
 | `reactionOpacity` | `100` | reaction opacity in percent |
 | `reactionCooldown` | `0` | seconds each viewer waits between reactions on your stream |
+| `autoSwitchToGame` | `true` | while you share a game launcher, move the stream to the game when it starts and back when it ends |
+| `autoSwitchGames` | `[]` | more launcher/game pairs (League is built in), e.g. `[{ "launcher": "Launcher.exe", "game": "Game.exe" }]`; several exe names can be comma-separated |
 
 Log: `%APPDATA%\TSDraw\tsdraw.log` (tray → *Open log*).
 
@@ -201,9 +211,10 @@ Log: `%APPDATA%\TSDraw\tsdraw.log` (tray → *Open log*).
 | `src/Cdp.cs` | finds TeamSpeak's UI pages over DevTools, injects, carries messages |
 | `src/Overlay.cs` | streamer overlay, capture exclusion, screen/window tracking, stroke model |
 | `src/App.cs` | tray app, TeamSpeak launcher, routing between pages, overlays and the optional relay |
+| `src/GameSwitch.cs` | follow the game: spots a game starting from the launcher you share; the page then switches the stream |
 | `src/Updater.cs` | self-update from GitHub releases |
 | `VERSION`, `build.cmd`, `release.ps1` | version number, build, publish |
 | `src/Relay.cs`, `relay/tsdraw-relay.py` | optional relay: client, wire format, and server |
-| `test/` | pen-layer harness (`run-harness.mjs`), 3-client peer-to-peer simulation (`run-p2p.mjs`), fake relay peer (`fake-peer.mjs`) |
+| `test/` | pen-layer harness (`run-harness.mjs`), 3-client peer-to-peer simulation (`run-p2p.mjs`), fake relay peer (`fake-peer.mjs`), follow-the-game page test (`run-autosrc.mjs`) and window test (`run-gameswitch.cmd`, opens Notepad and Paint) |
 
 In TeamSpeak's DevTools console, `__tsdraw.links()` lists the peer-to-peer links and their states.

@@ -201,6 +201,8 @@ namespace TSDraw
         readonly object roomsLock = new object();
         CdpPage master;                  // the TeamSpeak window that does the peer-to-peer networking
         readonly System.Windows.Forms.Timer updateTimer = new System.Windows.Forms.Timer();
+        readonly GameSwitcher games;
+        readonly System.Windows.Forms.Timer gameTimer = new System.Windows.Forms.Timer { Interval = 1000 };
         Updater.Release pendingUpdate;
         bool updating;
         int p2pOpen, p2pTotal;
@@ -208,7 +210,7 @@ namespace TSDraw
         bool warnedNoCdp, restarting;
         int badMessages;
 
-        class OutboundInfo { public string Sid, SrcId, Title; public int Type; }
+        class OutboundInfo { public string Sid, SrcId, Title; public int Type, Status; }
         class PageLayers { public int Inbound; public bool Drawing; }
         readonly Dictionary<CdpPage, PageLayers> pageLayers = new Dictionary<CdpPage, PageLayers>();
         class PageSessions
@@ -243,6 +245,9 @@ namespace TSDraw
                 if (tray.Tag as string == "restart") RestartTeamSpeak(true);
                 else if (tray.Tag as string == "download") Process.Start(Updater.ReleasesPage);
             };
+
+            games = new GameSwitcher(cfg.AutoSwitchToGame, cfg.AutoSwitchGames, msg => { if (master != null) master.Evaluate(RecvJs(msg)); });
+            Log.W("follow the game: {0} ({1})", cfg.AutoSwitchToGame ? "on" : "off", string.Join("; ", games.Rules));
 
             cdp = new CdpManager(cfg.CdpPort, modJs);
             cdp.PageOpened += p => Post(() =>
@@ -288,6 +293,8 @@ namespace TSDraw
             }
             watchdog.Tick += (s, e) => { CheckTeamSpeak(); AnnouncePresence(); };
             watchdog.Start();
+            gameTimer.Tick += (s, e) => games.Tick(OutboundStreams());
+            gameTimer.Start();
             if (cfg.AutoUpdate)
             {
                 updateTimer.Interval = 20000;   // first check shortly after start, then every 6 hours
@@ -375,6 +382,7 @@ namespace TSDraw
 
         void SendHello(CdpPage p)
         {
+            if (p == master) games.ResendGuards();
             p.Evaluate(RecvJs(new Dictionary<string, object> {
                 { "t", "hello" }, { "name", Cfg.Name }, { "relay", PageRelayStatus() }, { "holdMs", (int)(Cfg.FadeSeconds * 1000) },
                 { "transport", relay == null ? "p2p" : "relay" }, { "master", p == master }, { "hotkey", Cfg.DrawHotkey },
@@ -415,6 +423,7 @@ namespace TSDraw
                         ps.Outbound.Add(new OutboundInfo
                         {
                             Sid = sid, Type = (int)Json.D(o, "type", 0), SrcId = Json.S1(o, "srcId") ?? "", Title = Json.S1(o, "title") ?? "",
+                            Status = (int)Json.D(o, "status", 0),
                         });
                     }
                     foreach (var o in Json.Arr(d, "inbound").OfType<Dictionary<string, object>>())
@@ -464,6 +473,12 @@ namespace TSDraw
                 case "color":
                     var c = Json.S1(d, "c");
                     if (c != null && Regex.IsMatch(c, "^#[0-9a-fA-F]{6}$")) DrawColor = ColorTranslator.FromHtml(c);
+                    break;
+                case "autosrc":   // the page's answer to a game switch
+                    games.OnResult(Json.S1(d, "sid"), Json.S1(d, "to"), Json.B(d, "ok"), Json.S1(d, "err"), Json.S1(d, "title"));
+                    break;
+                case "srclost":   // a game window being streamed closed: switch back right away
+                    games.Tick(OutboundStreams());
                     break;
                 case "p2p":
                     p2pOpen = (int)Json.D(d, "open", 0);
@@ -610,6 +625,12 @@ namespace TSDraw
                 T = "here", Sid = sid, From = InstanceId, Name = Cfg.Name,
                 PolEmotes = Cfg.ReactionEmotes, PolImages = Cfg.ReactionImages, PolCooldown = Cfg.ReactionCooldown,
             };
+        }
+
+        List<GameSwitcher.Stream> OutboundStreams()
+        {
+            return pageSessions.Values.SelectMany(p => p.Outbound).GroupBy(o => o.Sid).Select(g => g.First())
+                .Select(o => new GameSwitcher.Stream { Sid = o.Sid, SrcId = o.SrcId, Type = o.Type, Status = o.Status }).ToList();
         }
 
         void Recompute()
@@ -767,6 +788,13 @@ namespace TSDraw
             m.Items.Add(draw);
             m.Items.Add(new ToolStripMenuItem("Clear my drawings", null, (s, e) => { foreach (var o in overlays.Values) o.ClearOwn(); }) { Enabled = ov != null });
             m.Items.Add(ReactionsMenu());
+            m.Items.Add(new ToolStripMenuItem("Switch my stream to the game when it starts", null, (s, e) =>
+            {
+                Cfg.AutoSwitchToGame = !Cfg.AutoSwitchToGame;
+                Cfg.Save();
+                games.Enabled = Cfg.AutoSwitchToGame;
+                Log.W("follow the game: {0}", Cfg.AutoSwitchToGame ? "on" : "off");
+            }) { Checked = Cfg.AutoSwitchToGame, ToolTipText = "While you share the League of Legends client, the stream moves to the game when it starts and back when it ends." });
             m.Items.Add(new ToolStripSeparator());
 
             bool running = TeamSpeak.Running().Length > 0;
@@ -860,6 +888,7 @@ namespace TSDraw
         {
             watchdog.Stop();
             updateTimer.Stop();
+            gameTimer.Stop();
             cdp.Stop("window.__tsdraw&&window.__tsdraw.remove()");
             if (relay != null) relay.Stop();
             foreach (var o in overlays.Values) o.Dispose();
