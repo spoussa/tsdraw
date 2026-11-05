@@ -50,6 +50,14 @@ let r = await replies();
 check("switch to game: TeamSpeak's updateSession used", (await S("s.updates.length")) === 1 && (await S("s.updates[0].fromInfo.id")) === "200", await S("s.updates"));
 check("switch to game: config name and quality passed", (await S("s.updates[0].fromConfig.audio")) === true && (await S("s.updates[0].fromQuality.width")) === 1280);
 check("switch to game: answered ok with the title", r.length === 1 && r[0].ok && r[0].to === "200" && r[0].title === "League of Legends (TM) Client", r);
+const ids = await ev("window.ids");
+const audioOf = async (i) => (await S(`s.updates[${i}].fromConfig.appAudio`));
+let aa = await audioOf(0);
+check("switch to game: audio swapped from the client to the game (added by path, not listed yet)",
+  aa && aa.scope === 0 && aa.entries.map((e) => e.identity).join("|") === [ids.SPOTIFY, ids.GAME].join("|"), aa);
+check("switch to game: other apps keep their volume", aa && aa.entries[0].gain === 0.5 && aa.entries[1].gain === 1 && aa.entries[1].captured === true, aa);
+const calls = await ev("window.audioCalls");
+check("switch to game: app list subscription closed again", calls.subscribe === 1 && calls.unsubscribe === 1 && calls.suggest === 2, calls);
 
 // 2. The game window closes: TeamSpeak would leave; we don't.
 await S("(s.captureStatus = -1, 0)");
@@ -63,6 +71,8 @@ await recv({ to: "100", guard: "200" });
 await sleep(300);
 await S("(s.captureStatus = 4, 0)");
 check("switch back: source is the launcher", (await S("s.sourceInfo.id")) === "100");
+aa = await audioOf(1);
+check("switch back: audio back to the client", aa && aa.entries.map((e) => e.identity).join("|") === [ids.SPOTIFY, ids.CLIENT].join("|"), aa);
 await sleep(700);   // past the (shortened) 60 s wait
 check("switch back: the wait was cancelled, stream kept", (await S("s.left")) === 0);
 await recv({ guard: "" });
@@ -97,6 +107,21 @@ await sleep(300);
 r = await replies();
 check("unknown window: answered not ok", !r[r.length - 1].ok && /can't share/.test(r[r.length - 1].err), r[r.length - 1]);
 check("unknown window: source unchanged", (await S("s.sourceInfo.id")) === "300");
+check("fallback: app audio sent with the direct switch", ns[0] && ns[0].app_audio && ns[0].app_audio.entries.some((e) => e.identity === ids.GAME) && ns[0].capture_audio === true, ns[0]);
+
+// 8. "All apps" audio mode: nothing to change. Game now listed (it played a sound): matched normally.
+await S("(s.rejectUpdates = false, s.config.appAudio = { scope: 2, masterGain: 1, entries: [] }, 0)");
+await recv({ to: "100", guard: "" });
+await sleep(300);
+const nUpd = await S("s.updates.length");
+aa = await S(`s.updates[${nUpd - 1}].fromConfig.appAudio`);
+check("all-apps audio mode left alone", aa && aa.scope === 2 && aa.entries.length === 0, aa);
+await ev(`window.apps.push({ identity: window.ids.GAME, displayName: "League of Legends (TM) Client", matchKeys: ["league of legends (tm) client", window.ids.GAME.slice(12), "league of legends.exe"] })`);
+await S("(s.config.appAudio = { scope: 0, masterGain: 1, entries: [{ identity: window.ids.CLIENT, gain: 1, captured: true }] }, 0)");
+await recv({ to: "200", guard: "200" });
+await sleep(300);
+aa = await S(`s.updates[${nUpd}].fromConfig.appAudio`);
+check("listed game: client swapped for the game", aa && aa.entries.length === 1 && aa.entries[0].identity === ids.GAME, aa);
 
 const logs = await ev(`window.sent.filter(m => m.t === 'log').map(m => m.msg)`);
 for (const c of checks) console.log((c.ok ? "PASS " : "FAIL ") + c.name + (c.ok ? "" : "  " + JSON.stringify(c.detail)));

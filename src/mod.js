@@ -1672,16 +1672,105 @@
     };
   }
 
+  // ---- the stream's audio follows too
+  // Window streams usually capture "only these apps" audio, with the shared window's app
+  // in the list. TeamSpeak's own edit dialog swaps the old window's app for the new one's
+  // when you change a stream's window; we do the same, using the same native calls.
+  const APP_AUDIO_INCLUDE_ONLY = 0;
+
+  function findVm(pred) {
+    let root = null;
+    for (const el of document.querySelectorAll("body *")) if (el.__vue__) { root = el.__vue__.$root; break; }
+    let hit = null;
+    const visit = (vm, d) => {
+      if (!vm || d > 60 || hit) return;
+      try { if (pred(vm)) { hit = vm; return; } } catch (e) {}
+      for (const ch of vm.$children || []) visit(ch, d + 1);
+    };
+    visit(root, 0);
+    return hit;
+  }
+
+  // Apps whose audio TeamSpeak can capture: [{identity, displayName, matchKeys}].
+  function capturableApps() {
+    // An open share dialog has the list and the subscription; borrow it rather than replace it.
+    const dlg = findVm((vm) => Array.isArray(vm.capturableApps) && vm.catalogueObserver);
+    if (dlg) return Promise.resolve(dlg.capturableApps);
+    return new Promise((resolve) => {
+      const api = window.tsclient_internal;
+      if (!api || typeof api.subscribeCapturableAudioApps !== "function") { resolve([]); return; }
+      let done = false, timer = 0;
+      const finish = (apps) => {
+        if (done) return;
+        done = true; clearTimeout(timer);
+        try { api.unsubscribeCapturableAudioApps(() => {}); } catch (e) {}
+        resolve(apps || []);
+      };
+      timer = setTimeout(() => finish([]), 3000);
+      try {
+        api.subscribeCapturableAudioApps((err, data) => {
+          if (err === 0 && data && Array.isArray(data.apps) && (data.status || "ready") === "ready") finish(data.apps);
+        });
+      } catch (e) { finish([]); }
+    });
+  }
+
+  // TeamSpeak's guess of which app plays a window's audio: {primaryMatchKey, secondaryMatchKey}.
+  function audioSuggestion(windowId) {
+    return new Promise((resolve) => {
+      const fn = window.tsclient_internal && tsclient_internal.getAppAudioSourceSuggestion;
+      if (typeof fn !== "function" || !/^[1-9]\d*$/.test(windowId)) { resolve(null); return; }
+      const timer = setTimeout(() => resolve(null), 2000);
+      try {
+        fn(windowId, (err, r) => { clearTimeout(timer); resolve(err === 0 && r && r.payload ? r.payload.suggestion || null : null); });
+      } catch (e) { clearTimeout(timer); resolve(null); }
+    });
+  }
+
+  // The app a suggestion points at, matched the way TeamSpeak does (one unambiguous app).
+  function suggestedApp(sug, apps) {
+    if (!sug) return null;
+    const find = (key) => {
+      if (!key) return null;
+      const hits = apps.filter((a) => Array.isArray(a.matchKeys) && a.matchKeys.includes(key));
+      return hits.length === 1 ? hits[0] : hits.length > 1 ? "many" : null;
+    };
+    const a = find(sug.primaryMatchKey), b = find(sug.secondaryMatchKey);
+    if (a === "many" || b === "many") return null;
+    if (a && b) return a.identity === b.identity ? a : null;
+    if (a || b) return a || b;
+    // A game that hasn't played a sound yet isn't listed. TeamSpeak names apps
+    // "windows-app:<exe path>", and its lists keep apps that aren't running, so add it by path.
+    const path = String(sug.primaryMatchKey || "");
+    return /^[a-z]:\\.+\.exe$/i.test(path) ? { identity: "windows-app:" + path.toLowerCase(), displayName: path.split("\\").pop() } : null;
+  }
+
+  // The stream's app audio after moving it from one window to another (null: leave it).
+  async function followAppAudio(s, fromId, toId) {
+    const cur = s.config && s.config.appAudio;
+    if (!cur || cur.scope !== APP_AUDIO_INCLUDE_ONLY) return null;   // the other modes capture every app anyway
+    const [apps, sugFrom, sugTo] = await Promise.all([capturableApps(), audioSuggestion(fromId), audioSuggestion(toId)]);
+    const appFrom = suggestedApp(sugFrom, apps), appTo = suggestedApp(sugTo, apps);
+    if (!appTo) return null;
+    let entries = (cur.entries || []).map((e) => Object.assign({}, e));
+    if (appFrom && appFrom.identity !== appTo.identity) entries = entries.filter((e) => e.identity !== appFrom.identity);
+    if (!entries.some((e) => e.identity === appTo.identity)) entries.push({ identity: appTo.identity, gain: 1, captured: true });
+    else entries = entries.map((e) => (e.identity === appTo.identity ? Object.assign(e, { captured: true }) : e));
+    log("stream audio now from " + (appTo.displayName || appTo.identity) + (appFrom && appFrom.identity !== appTo.identity ? " instead of " + (appFrom.displayName || appFrom.identity) : ""));
+    return { scope: cur.scope, masterGain: cur.masterGain != null ? cur.masterGain : 1, entries };
+  }
+
   // The fallback if TeamSpeak's object refuses: the native call its stream preview uses.
-  function nativeSwitch(s, info) {
+  function nativeSwitch(s, info, config) {
     return new Promise((resolve, reject) => {
       const q = typeof s.getQualityWithCamOverrides === "function" ? s.getQualityWithCamOverrides() : s.quality;
       tsclient_internal.postMessage({ cmd: "switchSource", payload: {
         id: s.id, type: info.type, source_id: info.id, quality: q, wanted_capability_video_type: info.pixelFormat,
-        wanted_capability_interlaced: info.interlaced, capture_audio: !!(s.config && s.config.audio),
-        app_audio: (s.config && s.config.appAudio) || undefined,
+        wanted_capability_interlaced: info.interlaced, capture_audio: !!config.audio, app_audio: config.appAudio || undefined,
       } }, (r) => {
-        if (r && r.err === 0) { try { s.sourceInfo = info; } catch (e) {} resolve(); } else reject("switchSource error " + (r && r.err));
+        if (!r || r.err !== 0) { reject("switchSource error " + (r && r.err)); return; }
+        try { s.sourceInfo = info; if (config.appAudio) s.config.appAudio = config.appAudio; } catch (e) {}
+        resolve();
       });
     });
   }
@@ -1702,11 +1791,16 @@
       const w = (await windowList()).find((x) => String(x.sourceId) === to);
       if (!w) throw new Error("TeamSpeak can't share that window (yet)");
       const info = { id: String(w.sourceId), type: SOURCE_WINDOW, interlaced: true, pixelFormat: "I420", name: w.title || "", supportsAudio: !!w.supportsAudio };
+      const config = Object.assign({}, s.config);
       try {
-        await s.updateSession({ fromInfo: info, fromQuality: s.getQualityWithCamOverrides(), fromConfig: Object.assign({}, s.config) });
+        const appAudio = await followAppAudio(s, s.sourceInfo ? String(s.sourceInfo.id) : "", to);
+        if (appAudio) config.appAudio = appAudio;
+      } catch (e) { log("couldn't work out the new window's audio: " + e); }
+      try {
+        await s.updateSession({ fromInfo: info, fromQuality: s.getQualityWithCamOverrides(), fromConfig: config });
       } catch (e) {
         log("stream update refused (" + (e && e.message || e) + "); switching the capture directly");
-        await nativeSwitch(s, info);
+        await nativeSwitch(s, info, config);
       }
       clearTimeout(a.lostTimer); a.lostTimer = 0;
       reply(true, { title: info.name });

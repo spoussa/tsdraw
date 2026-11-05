@@ -11,6 +11,19 @@
   // outbound stream object: the captureStatus setter calls onCaptureStatusChanged, which
   // leaves the stream when the capture fails; updateSession changes a live stream's source.
   const SID = "99999999-8888-7777-6666-555555555555";
+  // App audio, as TeamSpeak reports it. The game hasn't played a sound yet, so it isn't listed.
+  const CLIENT_PATH = "c:\\riot games\\league of legends\\leagueclientux.exe";
+  const GAME_PATH = "c:\\riot games\\league of legends\\game\\league of legends.exe";
+  const CLIENT = "windows-app:" + CLIENT_PATH, GAME = "windows-app:" + GAME_PATH;
+  const SPOTIFY = "windows-app:c:\\users\\me\\appdata\\roaming\\spotify\\spotify.exe";
+  window.ids = { CLIENT, GAME, SPOTIFY };
+  window.apps = [
+    { identity: CLIENT, displayName: "League of Legends", matchKeys: ["league of legends", CLIENT_PATH, "leagueclientux.exe"] },
+    { identity: SPOTIFY, displayName: "Spotify", matchKeys: ["spotify", SPOTIFY.slice(12), "spotify.exe"] }];
+  const suggestions = { "100": { primaryMatchKey: CLIENT_PATH, secondaryMatchKey: "leagueclientux.exe" },
+    "200": { primaryMatchKey: GAME_PATH, secondaryMatchKey: "league of legends.exe" },
+    "300": { primaryMatchKey: GAME_PATH, secondaryMatchKey: "league of legends.exe" } };
+  window.audioCalls = { subscribe: 0, unsubscribe: 0, suggest: 0 };
   // The 60 s wait for the launcher is shortened so the test can see it run out.
   const realSetTimeout = window.setTimeout;
   window.setTimeout = (f, ms, ...a) => realSetTimeout(f, ms === 60000 ? 400 : ms, ...a);
@@ -19,7 +32,9 @@
     constructor() {
       this.id = 7; this.idData = { scHandlerId: 1, serverSessionId: SID };
       this._sourceInfo = { id: "100", type: 3, name: "League of Legends", interlaced: true, pixelFormat: "I420" };
-      this._captureStatus = 4; this.config = { name: "League of Legends", type: 3, audio: true }; this._published = true;
+      this._captureStatus = 4; this._published = true;
+      this.config = { name: "League of Legends", type: 3, audio: true, appAudio: { scope: 0, masterGain: 1, entries: [
+        { identity: CLIENT, gain: 1, captured: true }, { identity: SPOTIFY, gain: 0.5, captured: true }] } };
       this.left = 0; this.statusCalls = 0; this.updates = []; this.rejectUpdates = false;
     }
     get sourceInfo() { return this._sourceInfo; }
@@ -57,6 +72,9 @@
       } else if (cb) cb({ err: 1 });
     },
     setClientSelfVariables(sc, v, x, cb) { if (cb) cb(0); },
+    subscribeCapturableAudioApps(cb) { audioCalls.subscribe++; setTimeout(() => { cb(0, { apps: [], status: "loading" }); cb(0, { apps: window.apps, status: "ready" }); }, 20); },
+    unsubscribeCapturableAudioApps(cb) { audioCalls.unsubscribe++; if (cb) cb(0); },
+    getAppAudioSourceSuggestion(id, cb) { audioCalls.suggest++; setTimeout(() => cb(0, { payload: { suggestion: suggestions[id] || null } }), 10); },
   };
   window.sent = [];
   window.__tsdrawSend = (s) => window.sent.push(JSON.parse(s));
